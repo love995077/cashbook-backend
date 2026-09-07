@@ -1,0 +1,146 @@
+# Production stack: MySQL + the FastAPI app behind gunicorn.
+#
+#   cp .env.production.example .env.production   # then fill in real secrets
+#   docker compose --env-file .env.production up -d --build
+#
+# The schema is created once by the `migrate` service, not by the API workers.
+# See the AUTO_CREATE_TABLES note in app/config.py.
+
+name: cashbook
+
+services:
+  db:
+    image: mysql:8.4
+    restart: unless-stopped
+    # Secrets come from the env file; nothing sensitive is written here.
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in the env file}
+      MYSQL_DATABASE: ${DB_NAME:-cash_book}
+      MYSQL_USER: ${DB_USER:?set DB_USER in the env file}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in the env file}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - db_data:/var/lib/mysql
+    # NOT published to the host by default. Uncomment only if you need to
+    # connect a GUI client, and understand that it exposes MySQL to the network.
+    # ports:
+    #   - "127.0.0.1:3306:3306"
+    healthcheck:
+      # Other services wait on this, so the app never starts against a database
+      # that is still initialising.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    networks:
+      - internal
+
+  # One-shot: creates the tables, then exits. Run before the API is useful, and
+  # again after any model change. Replace with `alembic upgrade head` once
+  # migrations exist — create_all cannot alter an existing table.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: "no"
+    command: ["python", "scripts/create_tables.py"]
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-cash_book}
+      AUTO_CREATE_TABLES: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # --- database -------------------------------------------------------
+      # `db` is the compose service name. A DB_HOST of localhost would point at
+      # the container itself, which is the usual first mistake here.
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-cash_book}
+      DB_ECHO: "false"
+      # The `migrate` service owns the schema.
+      AUTO_CREATE_TABLES: "false"
+
+      # --- auth -----------------------------------------------------------
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in the env file}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-10080}
+
+      # --- clients --------------------------------------------------------
+      # "*" is a development default. Name the real origins in production.
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+
+      # --- optional integrations -----------------------------------------
+      STT_PROVIDER: ${STT_PROVIDER:-}
+      STT_MODEL: ${STT_MODEL:-small}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      NOTIFICATIONS_ENABLED: ${NOTIFICATIONS_ENABLED:-false}
+      NOTIFY_PROVIDER: ${NOTIFY_PROVIDER:-}
+      LARGE_ADVANCE_THRESHOLD: ${LARGE_ADVANCE_THRESHOLD:-3000}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
+
+      # --- media uploads (Phase 9) -----------------------------------------
+      # Site photos and voice notes land on the volume mounted below. This
+      # path is INSIDE the container; the named volume is what makes it
+      # survive a rebuild.
+      MEDIA_BACKEND: ${MEDIA_BACKEND:-local}
+      MEDIA_ROOT: /app/media
+      MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-12582912}
+      MAX_AUDIO_NOTE_BYTES: ${MAX_AUDIO_NOTE_BYTES:-5242880}
+
+      # --- server ---------------------------------------------------------
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-4}
+    volumes:
+      # Without this the gallery is wiped on every `docker compose up --build`,
+      # and it is the reason `api` cannot simply be scaled to two replicas:
+      # a local named volume is not shared between hosts. Move
+      # MEDIA_BACKEND to s3 before scaling out.
+      - media_data:/app/media
+    ports:
+      # Bound to loopback: put a TLS-terminating proxy in front rather than
+      # exposing the app directly. Change to "8000:8000" only for a private
+      # network you control.
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  db_data:
+  media_data:
+
+networks:
+  internal:
+    driver: bridge

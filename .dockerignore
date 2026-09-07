@@ -1,0 +1,34 @@
+# Keep the build context small and secrets out of the image.
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# The mobile app is built by EAS, not by this image.
+mobile/
+
+.git/
+.gitignore
+.vscode/
+.idea/
+*.md
+!README.md
+
+# Local artefacts
+*.pdf
+*.sqlite
+*.db
+logs/
+
+# Never bake local uploads into the image; they live on a volume.
+media/
