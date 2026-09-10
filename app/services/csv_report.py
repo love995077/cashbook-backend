@@ -84,7 +84,8 @@ def transactions_csv(
         [
             tx.date.isoformat(),
             workers[tx.worker_id].name if tx.worker_id in workers else "",
-            workers[tx.worker_id].phone if tx.worker_id in workers else "",
+            # Nullable now — a worker can be on the crew without a number.
+            (workers[tx.worker_id].phone or "") if tx.worker_id in workers else "",
             tx.type.value,
             TYPE_LABELS[tx.type],
             _amount(tx.amount),

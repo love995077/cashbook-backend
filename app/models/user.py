@@ -7,7 +7,7 @@ from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
-from app.models.enums import UserRole, WageType, WorkerTrade
+from app.models.enums import UserRole, WageType
 
 if TYPE_CHECKING:
     from app.models.advance_request import AdvanceRequest
@@ -23,10 +23,25 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
-    phone: Mapped[str] = mapped_column(String(20), unique=True, index=True, nullable=False)
 
-    # bcrypt digest; never exposed through any schema.
-    password_hash: Mapped[str] = mapped_column(String(60), nullable=False)
+    # Nullable: the only thing an admin must supply to put someone on the crew
+    # is a name. A labourer taken on for a fortnight may not have a number worth
+    # recording, and refusing to book them until one exists is how a crew list
+    # stops matching the crew.
+    #
+    # Still UNIQUE, and MySQL permits any number of NULLs in a unique index, so
+    # the constraint keeps doing its real job — no two accounts share a number —
+    # without forcing one to exist. A worker with no phone simply has no way to
+    # sign in; they are a record their contractor keeps, not an account.
+    phone: Mapped[Optional[str]] = mapped_column(
+        String(20), unique=True, index=True, nullable=True
+    )
+
+    # bcrypt digest; never exposed through any schema. Nullable for the same
+    # reason as `phone`: no PIN means no sign-in, not a rejected worker. The
+    # login route refuses an empty digest outright rather than letting it reach
+    # bcrypt, which would otherwise compare against nothing.
+    password_hash: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
 
     role: Mapped[UserRole] = mapped_column(
         SAEnum(UserRole, values_callable=lambda e: [m.value for m in e], name="user_role"),
@@ -53,18 +68,22 @@ class User(Base):
         index=True,
     )
 
-    # What the worker does on site. Nullable: contractors do not have one, and
-    # a crew that predates this column should read as "not set" rather than
-    # being backfilled with a guess.
-    trade: Mapped[Optional[WorkerTrade]] = mapped_column(
-        SAEnum(
-            WorkerTrade,
-            values_callable=lambda e: [m.value for m in e],
-            name="worker_trade",
-        ),
-        nullable=True,
-        index=True,
-    )
+    # What the worker does on site — their post. Free text rather than an enum:
+    # the thirteen values in `WorkerTrade` do not cover a real crew, which turns
+    # up shuttering carpenters, chowkidars and bar-bending helpers, and a post
+    # that needs a migration before it can be typed gets recorded as something
+    # else or not at all.
+    #
+    # `WorkerTrade` survives as the catalogue of well-known posts: it still
+    # drives the suggestion chips and the icons in the app. It is no longer a
+    # constraint.
+    #
+    # Countability is kept by normalising on the way in — see `_normalise_trade`
+    # in app/schemas/user.py. "Mason", "mason" and "MASON" all store as `mason`,
+    # so a breakdown by post still groups, which was the original reason this
+    # was an enum. Nullable: contractors do not have a post, and a crew that
+    # predates this column reads as "not set" rather than being backfilled.
+    trade: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
 
     # Workers are linked to the contractor they work for.
     contractor_id: Mapped[Optional[int]] = mapped_column(

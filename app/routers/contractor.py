@@ -115,17 +115,29 @@ def _check_staff_site(db: Session, staff: User, site_id: Optional[int]) -> Optio
 def add_worker(
     payload: WorkerCreate, contractor: CurrentContractor, db: DbSession
 ) -> User:
-    """Add a worker to the calling contractor's crew."""
-    if db.scalar(select(User).where(User.phone == payload.phone)) is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An account with this phone number already exists",
-        )
+    """Add a worker to the calling contractor's crew.
+
+    Only the name is required. A worker booked without a phone number or a PIN
+    is a record the contractor keeps rather than an account that can sign in;
+    both can be filled in later. See `WorkerCreate`.
+    """
+    # Only worth asking when a number was actually given. `User.phone` is
+    # nullable and MySQL allows many NULLs in a unique index, so an absent
+    # number cannot collide with anything.
+    if payload.phone is not None:
+        if db.scalar(select(User).where(User.phone == payload.phone)) is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account with this phone number already exists",
+            )
 
     worker = User(
         name=payload.name,
         phone=payload.phone,
-        password_hash=hash_password(payload.password),
+        # No PIN means no digest to compare, which the login route reads as
+        # "this worker cannot sign in" rather than hashing an empty string —
+        # that would be a real password, and a guessable one.
+        password_hash=hash_password(payload.password) if payload.password else None,
         role=UserRole.WORKER,
         daily_wage=payload.daily_wage,
         trade=payload.trade,

@@ -69,7 +69,16 @@ def login(payload: LoginRequest, db: DbSession) -> TokenResponse:
     user = db.scalar(select(User).where(User.phone == payload.phone))
     # Same message either way, so the endpoint does not reveal which phone
     # numbers are registered.
-    if user is None or not verify_password(payload.password, user.password_hash):
+    #
+    # `password_hash` is nullable: a worker booked onto the crew without a PIN
+    # has no digest, and is refused here rather than being passed to bcrypt.
+    # Checked before `verify_password` and folded into the same message, so a
+    # missing PIN is not distinguishable from a wrong one.
+    if (
+        user is None
+        or user.password_hash is None
+        or not verify_password(payload.password, user.password_hash)
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect phone number or password",

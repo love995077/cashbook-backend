@@ -4,7 +4,7 @@ from typing import Annotated, Optional
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
-from app.models.enums import UserRole, WageType, WorkerTrade
+from app.models.enums import UserRole, WageType
 
 Phone = Annotated[str, Field(min_length=7, max_length=20, pattern=r"^\+?[0-9\- ]{7,20}$")]
 
@@ -22,16 +22,49 @@ def _strip_name(v: str) -> str:
 Name = Annotated[str, Field(min_length=1, max_length=120), AfterValidator(_strip_name)]
 
 
+def _normalise_trade(v: Optional[str]) -> Optional[str]:
+    """Fold a typed-in post to one canonical spelling.
+
+    The post used to be an enum, for a reason worth keeping: "Electrician",
+    "electrician" and "ELECTRICIAN" are one post, and storing them as typed
+    splits that post across three rows of every breakdown.
+
+    Free text keeps the flexibility a real crew needs — shuttering carpenter,
+    chowkidar, bar-bending helper — without giving that up: whitespace is
+    collapsed, the value is lowercased and spaces and hyphens become
+    underscores. So the well-known posts land on exactly the values the old
+    enum used (`bar_bender`, `general_labour`) and the app's icon lookup still
+    finds them, while anything new is merely consistent with itself.
+
+    Display is the app's job: `site_engineer` is drawn as "Site engineer".
+    Blank collapses to None — an empty string is not a post, it is an unset one.
+    """
+    if v is None:
+        return None
+    collapsed = "_".join(v.replace("-", " ").replace("_", " ").split())
+    return collapsed.lower() or None
+
+
+# A worker's post on site. Free text since the crew is not enumerable, but
+# normalised so it stays countable. See `_normalise_trade`.
+Trade = Annotated[
+    Optional[str], Field(default=None, max_length=50), AfterValidator(_normalise_trade)
+]
+
+
 class UserBase(BaseModel):
     name: Name
-    phone: Phone
+    # Optional: a worker can be on the crew without a number to their name.
+    # See the note on `User.phone`. Contractors always have one — they signed
+    # up with it — so this being None in practice means "worker".
+    phone: Optional[Phone] = None
     role: UserRole
     daily_wage: Optional[Decimal] = Field(
         default=None, ge=0, max_digits=10, decimal_places=2
     )
     # What the worker does on site. None means it was never recorded, which
     # the app shows as "No trade set" rather than guessing.
-    trade: Optional[WorkerTrade] = None
+    trade: Trade = None
     # How they are paid. Drives which control the attendance grid draws for
     # them: a P/A/H toggle, or a quantity and a rate.
     wage_type: WageType = WageType.DAILY
@@ -51,15 +84,24 @@ class WorkerCreate(BaseModel):
 
     The worker is always attached to the calling contractor, so contractor_id
     and role are not accepted here.
+
+    `name` is the only thing required. Everything else describes a worker the
+    contractor may not know yet on the morning they first turn up, and a form
+    that refuses the booking until all of it is known is a form that gets
+    filled with placeholder numbers.
+
+    A worker created without `phone` or `password` cannot sign in. That is the
+    intended reading: they are a record their contractor keeps and pays, and
+    either field can be filled in later.
     """
 
     name: Name
-    phone: Phone
-    password: Password
+    phone: Optional[Phone] = None
+    password: Optional[Password] = None
     daily_wage: Optional[Decimal] = Field(
         default=None, ge=0, max_digits=10, decimal_places=2
     )
-    trade: Optional[WorkerTrade] = None
+    trade: Trade = None
     wage_type: WageType = WageType.DAILY
     site_id: Optional[int] = Field(default=None, gt=0)
 
@@ -77,7 +119,7 @@ class WorkerUpdate(BaseModel):
     daily_wage: Optional[Decimal] = Field(
         default=None, ge=0, max_digits=10, decimal_places=2
     )
-    trade: Optional[WorkerTrade] = None
+    trade: Trade = None
     # Switching an existing worker between daily and piece-rate. Optional, so
     # an edit that does not mention it leaves them on whatever they were.
     wage_type: Optional[WageType] = None
@@ -96,7 +138,7 @@ class UserUpdate(BaseModel):
     daily_wage: Optional[Decimal] = Field(
         default=None, ge=0, max_digits=10, decimal_places=2
     )
-    trade: Optional[WorkerTrade] = None
+    trade: Trade = None
     wage_type: Optional[WageType] = None
     contractor_id: Optional[int] = Field(default=None, gt=0)
     is_active: Optional[bool] = None

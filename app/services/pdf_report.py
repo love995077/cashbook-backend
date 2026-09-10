@@ -183,7 +183,8 @@ def build_worker_statement(
 
     details = [
         ["Worker", worker.name],
-        ["Phone", worker.phone],
+        # Nullable — reportlab renders a bare None as the literal "None".
+        ["Phone", worker.phone or "Not set"],
         ["Day rate", _money(worker.daily_wage) if worker.daily_wage is not None else "Not set"],
         ["Contractor", contractor.name if contractor else "-"],
         ["Generated", _day(generated_on)],

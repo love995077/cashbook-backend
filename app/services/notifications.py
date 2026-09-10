@@ -161,6 +161,16 @@ async def notify_transaction(
     Swallows every error on purpose. This runs after the response has been
     sent, and a messaging outage must never surface as a failed ledger write.
     """
+    # A worker booked without a phone number has nowhere to be messaged. Not an
+    # error, and not worth an exception: there is simply no recipient.
+    if not worker.phone:
+        logger.debug(
+            "Notification skipped for transaction %s: worker %s has no phone number",
+            transaction.id,
+            worker.id,
+        )
+        return
+
     try:
         await send_message(to_e164(worker.phone), compose_message(transaction, worker, contractor, balance))
     except NotificationsUnavailable as exc:

@@ -31,16 +31,26 @@ class UserRole(str, enum.Enum):
 
 
 class WorkerTrade(str, enum.Enum):
-    """What a worker actually does on site.
+    """The well-known posts a worker can hold on site.
 
-    An enum rather than free text, for the same reason MaterialUnit is one:
-    "electrician"/"Electrician"/"elec" would split one trade across three rows
-    of any breakdown, and the app maps each value to a fixed icon. Adding a
-    trade costs a migration - a deliberate trade for a list that stays
-    countable.
+    NO LONGER A CONSTRAINT. `users.trade` is a VARCHAR: a real crew turns up
+    with posts this list does not have - shuttering carpenter, chowkidar,
+    bar-bending helper - and a post that needs a migration before it can be
+    typed gets recorded as something else, or not at all.
+
+    What survives is the catalogue. These values seed the suggestion chips in
+    the app and are the keys its icon table is written against, so picking
+    "Mason" from the suggestions still gets the mason icon.
+
+    The reason it was once an enum has not gone away: "electrician",
+    "Electrician" and "elec" are one post, and storing them as typed splits it
+    across three rows of every breakdown. That is now handled on the way in
+    instead, by `_normalise_trade` in app/schemas/user.py, which lowercases and
+    underscores whatever was typed. The values below are already in that form,
+    so a suggestion and the same word typed by hand land on the same string.
 
     GENERAL_LABOUR is the catch-all, not the default: the column is nullable,
-    so a worker whose trade was never recorded reads as unset rather than
+    so a worker whose post was never recorded reads as unset rather than
     being silently filed as unskilled.
     """
 
