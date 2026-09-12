@@ -154,14 +154,35 @@ def _buckets_between(start: date_type, end: date_type, period: Period) -> list[d
 # --- queries ---------------------------------------------------------------
 
 
-def crew_ids(db: Session, contractor_id: int) -> list[int]:
-    return list(
-        db.scalars(
-            select(User.id).where(
-                User.contractor_id == contractor_id, User.role == UserRole.WORKER
-            )
-        ).all()
+def crew_ids(
+    db: Session, contractor_id: int, active_only: bool = False
+) -> list[int]:
+    """This contractor's workers.
+
+    WHY `active_only` IS A CHOICE AND NOT A DEFAULT
+    ----------------------------------------------
+    Taking a worker off the crew deactivates the row rather than deleting it
+    (see `remove_worker`), and the two kinds of figure on the Home screen want
+    opposite answers about them:
+
+      * Cash that has already moved — `wages_paid`, and therefore the balance —
+        must keep counting a removed worker. The advance was handed over; the
+        note left the tin. Dropping it would make the balance claim money the
+        contractor does not have.
+
+      * What is still OWED, and how many people are on the books, must not.
+        Nobody is waiting to be paid, so `outstanding_payable` and
+        `worker_count` are scoped to the active crew.
+
+    Passing the flag at each call site rather than filtering here is what keeps
+    those two apart.
+    """
+    stmt = select(User.id).where(
+        User.contractor_id == contractor_id, User.role == UserRole.WORKER
     )
+    if active_only:
+        stmt = stmt.where(User.is_active.is_(True))
+    return list(db.scalars(stmt).all())
 
 
 def _worker_rows(
@@ -204,8 +225,13 @@ def outstanding_payable(db: Session, contractor_id: int) -> Decimal:
 
     Workers in credit (paid ahead) are excluded rather than netted off - one
     worker's overpayment does not reduce what another is owed.
+
+    Active crew only. A worker taken off the crew is not standing there waiting
+    for their money, and leaving them in made "still owed" grow every time
+    somebody was removed mid-balance — the figure a contractor uses to decide
+    what to pay out on Saturday, quietly counting people who left in March.
     """
-    crew = crew_ids(db, contractor_id)
+    crew = crew_ids(db, contractor_id, active_only=True)
     if not crew:
         return ZERO
 
@@ -234,6 +260,8 @@ def build_summary(
     end: Optional[date_type] = None,
 ) -> CashSummary:
     """The Home screen numbers for one period (all time when unbounded)."""
+    # The whole crew, removed workers included: see `crew_ids`. Cash that
+    # reached somebody who has since left the job still left the cash box.
     crew = crew_ids(db, contractor_id)
 
     wages_earned = ZERO
@@ -262,7 +290,9 @@ def build_summary(
         wages_earned=wages_earned.quantize(CENTS),
         # Always lifetime: what is owed is not a property of a date range.
         outstanding_payable=outstanding_payable(db, contractor_id),
-        worker_count=len(crew),
+        # The crew as it stands today, which is what "across N workers" beside
+        # the owed figure is counting — not everyone who ever worked here.
+        worker_count=len(crew_ids(db, contractor_id, active_only=True)),
         start_date=start,
         end_date=end,
     )

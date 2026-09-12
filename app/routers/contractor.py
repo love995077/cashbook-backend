@@ -14,6 +14,7 @@ from app.dependencies import (
     DbSession,
     accessible_site_ids,
     require_site_access,
+    require_site_worker,
 )
 from app.models.advance_request import AdvanceRequest
 from app.models.attendance import Attendance
@@ -33,7 +34,12 @@ from app.models.transaction import Transaction
 from app.models.user import User
 from app.schemas.advance_request import AdvanceRequestDecision, AdvanceRequestRead
 from app.routers.media import attach_audio_note
-from app.schemas.attendance import AttendanceCreate, AttendanceRead, AttendanceScan
+from app.schemas.attendance import (
+    AttendanceCreate,
+    AttendanceRead,
+    AttendanceScan,
+    AttendanceUpdate,
+)
 from app.schemas.bulk_attendance import BulkAttendanceRequest, BulkAttendanceResult
 from app.schemas.deduction import DeductionInstallmentRead
 from app.schemas.cash import (
@@ -56,7 +62,7 @@ from app.services.cash import (
     ensure_default_categories,
 )
 from app.routers.piece_rate import build_piece_rate_log, ensure_no_active_plan
-from app.services.deductions import active_plans, apply_installment
+from app.services.deductions import active_plans, apply_installment, recompute_balance
 from app.services.ledger import build_worker_ledger, calculate_balance
 from app.services.storage import public_url
 from app.services.notifications import notify_transaction, should_notify
@@ -346,6 +352,133 @@ def log_attendance(
             status_code=status.HTTP_409_CONFLICT,
             detail="Attendance for this worker on this date has already been logged",
         ) from None
+    db.refresh(attendance)
+    return attendance
+
+
+def _resettle_installment(
+    db: Session,
+    worker_id: int,
+    old_date: date_type,
+    old_status: AttendanceStatus,
+    new_date: date_type,
+    new_status: AttendanceStatus,
+) -> None:
+    """Move a day's installment to match a corrected attendance row.
+
+    A day marked present under an active plan takes that day's deduction.
+    Correcting the day to absent has to give it back, or the worker quietly
+    pays an installment for a day they did not work — which is the exact thing
+    `EARNING_STATUSES` exists to prevent, and an edit must not be a way around
+    it.
+
+    Done by deleting the old day's row and re-applying against the new one,
+    rather than by arithmetic on `balance_remaining`: that column is a rollup
+    and `recompute_balance` is the only thing allowed to move it (see
+    app/services/deductions.py).
+
+    ONE THING IT DELIBERATELY DOES NOT DO
+    -------------------------------------
+    A plan closed by its final installment stays closed when that installment
+    is reversed, leaving a small balance on an inactive plan. `is_active=False`
+    means both "paid off" and "written off by hand" and the row cannot tell
+    them apart, so reopening one the contractor deliberately closed is the
+    worse mistake. The deductions screen shows the balance and can reopen it.
+    """
+    if (old_date, old_status) == (new_date, new_status):
+        return
+
+    # Found through the installment itself rather than through `active_plans`,
+    # so a day can still be given back after its plan has closed.
+    stale = db.scalar(
+        select(DeductionInstallment).where(
+            DeductionInstallment.worker_id == worker_id,
+            DeductionInstallment.date == old_date,
+        )
+    )
+    if stale is not None:
+        plan = db.get(AutoDeduction, stale.deduction_id)
+        db.delete(stale)
+        # So the sum below does not still see the row being removed.
+        db.flush()
+        if plan is not None:
+            recompute_balance(db, plan)
+
+    plan = active_plans(db, [worker_id]).get(worker_id)
+    if plan is not None:
+        apply_installment(db, plan, new_date, new_status)
+
+
+@router.patch("/attendance/{attendance_id}", response_model=AttendanceRead)
+def edit_attendance(
+    attendance_id: int,
+    payload: AttendanceUpdate,
+    staff: CurrentSiteStaff,
+    db: DbSession,
+) -> Attendance:
+    """Correct a day that was already marked.
+
+    The grid locks a marked row so a second submission cannot rewrite the day
+    by accident, which left no way at all to fix a genuine mistake — somebody
+    marked absent who was on the other block, a half day that was a full one.
+    This is that way, and it is a separate deliberate act rather than a
+    relaxation of the lock.
+
+    Open to a supervisor as well as an admin. They mark the day, so they are
+    the ones who find it wrong; `require_site_worker` narrows them to the crew
+    posted to a site they actually run.
+
+    Changing the status re-settles that day's installment — see
+    `_resettle_installment`. Piece-rate wages are untouched: they are paid on
+    quantity x rate, not on a status, so correcting who was present does not
+    change what was measured.
+    """
+    attendance = db.get(Attendance, attendance_id)
+    if attendance is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attendance record not found"
+        )
+    # Also proves the row belongs to a worker this caller may act on.
+    worker = require_site_worker(db, staff, attendance.worker_id)
+
+    fields = payload.model_dump(exclude_unset=True)
+    if not fields:
+        return attendance
+
+    old_date = attendance.date
+    old_status = attendance.status
+
+    new_date = fields.get("date", old_date)
+    if new_date > date_type.today():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A day cannot be marked before it happens",
+        )
+
+    for field, value in fields.items():
+        setattr(attendance, field, value)
+
+    try:
+        # Flushed before the installment work rather than left to the commit
+        # below. `apply_installment` runs its insert inside a SAVEPOINT and
+        # swallows IntegrityError as "this day is already deducted" — a clash
+        # on uq_attendance_worker_date surfacing in there would be caught by
+        # the wrong handler and roll this edit back without saying so.
+        db.flush()
+    except IntegrityError:
+        # The day it was moved onto is already marked. Merging the two rows is
+        # not this endpoint's call to make.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This worker is already marked for that date",
+        ) from None
+
+    _resettle_installment(
+        db, worker.id, old_date, old_status, attendance.date, attendance.status
+    )
+
+    db.commit()
     db.refresh(attendance)
     return attendance
 

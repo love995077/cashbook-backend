@@ -35,8 +35,14 @@ from app.dependencies import (
 )
 from app.models.attendance import Attendance
 from app.models.enums import AttendanceStatus, UserRole
+from app.models.inventory import MaterialReceipt
+from app.models.invoice import Invoice
+from app.models.machinery import MachineryLog
+from app.models.petty_cash import PettyCash
+from app.models.piece_rate import PieceRateLog
 from app.models.site import Site
 from app.models.site_photo import SitePhoto
+from app.models.tool import Tool
 from app.models.user import User
 from app.schemas.attendance import AttendanceRead
 from app.schemas.site import (
@@ -249,6 +255,122 @@ def edit_site(
         ) from None
     db.refresh(site)
     return _read_site(site)
+
+
+@router.delete("/{site_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_site(
+    site_id: int,
+    contractor: CurrentContractor,
+    db: DbSession,
+    purge: bool = Query(
+        default=False,
+        description=(
+            "Delete the row outright. Refused once the site has any history — "
+            "use it only to undo a mistyped site."
+        ),
+    ),
+) -> Response:
+    """Take a site off the list.
+
+    CLOSES BY DEFAULT, FOR THE SAME REASON A WORKER IS DEACTIVATED
+    -------------------------------------------------------------
+    Almost everything on a site hangs off `sites.id` with `ondelete=CASCADE`:
+    photos, petty cash, tools, inventory, material receipts, machinery logs
+    and invoices. Deleting a site that ran for a season therefore deletes the
+    season — the diesel receipts, the GRNs, the invoice already sent to the
+    client. "I have finished this job" and "erase everything that happened on
+    it" are different requests, and the first one is the one being made here.
+
+    So the row stays, `is_active` goes false, and the site drops out of the
+    pickers and the list while its history survives for the reports and
+    invoices that already went out.
+
+    `?purge=true` is the escape hatch for the real case a close does not cover:
+    a site added with the wrong name a minute ago. It is refused the moment any
+    history exists, so it can never be the thing that quietly deletes a job.
+
+    WHAT SURVIVES A PURGE
+    ---------------------
+    The things that are not the site's to delete. Workers posted here are
+    unposted (`users.site_id` is SET NULL) rather than removed — they are the
+    contractor's crew, not the site's. Attendance keeps its rows with a null
+    `site_id`, and piece-rate logs keep theirs: the wage they earned is in the
+    worker's ledger and must not move because a site was tidied up.
+    """
+    site = _reachable(db, contractor, site_id)
+
+    if purge:
+        # Counted rather than fetched: the question is only whether anything
+        # points at this site at all.
+        history = {
+            "photos": db.scalar(
+                select(func.count())
+                .select_from(SitePhoto)
+                .where(SitePhoto.site_id == site.id)
+            ),
+            "days of attendance": db.scalar(
+                select(func.count())
+                .select_from(Attendance)
+                .where(Attendance.site_id == site.id)
+            ),
+            "petty cash entries": db.scalar(
+                select(func.count())
+                .select_from(PettyCash)
+                .where(PettyCash.site_id == site.id)
+            ),
+            "material receipts": db.scalar(
+                select(func.count())
+                .select_from(MaterialReceipt)
+                .where(MaterialReceipt.site_id == site.id)
+            ),
+            "machinery logs": db.scalar(
+                select(func.count())
+                .select_from(MachineryLog)
+                .where(MachineryLog.site_id == site.id)
+            ),
+            "invoices": db.scalar(
+                select(func.count())
+                .select_from(Invoice)
+                .where(Invoice.site_id == site.id)
+            ),
+            "tools": db.scalar(
+                select(func.count()).select_from(Tool).where(Tool.site_id == site.id)
+            ),
+            "piece-rate logs": db.scalar(
+                select(func.count())
+                .select_from(PieceRateLog)
+                .where(PieceRateLog.site_id == site.id)
+            ),
+        }
+        blocking = [f"{count} {label}" for label, count in history.items() if count]
+        if blocking:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"{site.name} has "
+                    + ", ".join(blocking)
+                    + " on record. Deleting the site would delete that history too. "
+                    "Close the site instead — everything on it is kept."
+                ),
+            )
+
+        # Unposted before the delete rather than left to the FK. The column is
+        # SET NULL either way, but doing it here means the crew list is already
+        # right in this session rather than only after the next refresh.
+        for worker in list(site.workers):
+            worker.site_id = None
+
+        db.delete(site)
+        db.commit()
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    site.is_active = False
+    # The supervisor is released as well: a closed job is not something they
+    # are still running, and leaving the link would keep the site on their
+    # dashboard with nothing to do on it.
+    site.supervisor_id = None
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- the daily photo feed ---------------------------------------------------

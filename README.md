@@ -68,12 +68,31 @@ contractor routes reject workers and vice versa with a 403.
 | POST | `/contractor/workers` | `name, phone, password, daily_wage?` | 201 + the new worker |
 | GET | `/contractor/workers` | — | this contractor's crew |
 | POST | `/contractor/attendance` | `worker_id, date, status, note?` | 201 + the attendance row |
+| PATCH | `/contractor/attendance/{id}` | `date?, status?, shift?, note?` | the corrected row |
 | POST | `/contractor/transactions` | `worker_id, type, amount, date, note?` | 201 + the transaction |
 | GET | `/contractor/workers/{id}/ledger` | `?start_date&end_date` | that worker's ledger |
 
-`status` is `present`, `half_day` or `absent`; `type` is `wage`, `advance` or
-`payment`. A worker who belongs to a different contractor reads as a 404, and a
-second attendance row for the same worker and date is a 409.
+`status` is `present`, `half_day`, `absent` or `rain_out`; `type` is `wage`,
+`advance` or `payment`. A worker who belongs to a different contractor reads as
+a 404, and a second attendance row for the same worker and date is a 409.
+
+**Correcting a marked day.** `PATCH /contractor/attendance/{id}` changes only
+the fields sent. It is open to a supervisor as well as an admin — they mark the
+day, so they are the ones who find it wrong — narrowed by `require_site_worker`
+to the crew posted to a site they run.
+
+Changing the status re-settles that day's installment: a day corrected to
+`absent` gives back the deduction it had taken, and one corrected to `half_day`
+recovers half. That is done by deleting the day's `deduction_installments` row
+and re-applying, never by arithmetic on `balance_remaining` — it is a rollup and
+`recompute_balance` is the only thing allowed to move it. A plan closed by its
+final installment stays closed when that installment is reversed; `is_active`
+cannot distinguish "paid off" from "written off by hand", so reopening one the
+contractor deliberately closed would be the worse mistake.
+
+Moving a row onto a date the worker is already marked for is a 409 — merging
+two days into one is not this endpoint's call. Piece-rate wages are untouched:
+they are paid on quantity × rate, not on a status.
 
 ### Cash box (Phase 5)
 
@@ -114,6 +133,56 @@ advances given + payments settled. `wages_earned` is reported separately, and
 `outstanding_payable` (what is still owed to the crew, all time) is deliberately
 **not** subtracted from the balance - it has not been paid yet, so subtracting
 it would misstate the cash actually in hand.
+
+**Who counts as crew.** Removing a worker deactivates the row rather than
+deleting it, and the two kinds of figure here want opposite answers about them
+— see `crew_ids` in `app/services/cash.py`:
+
+- `outstanding_payable` and `worker_count` cover the **active** crew only.
+  Somebody taken off the books is not standing there waiting to be paid, and
+  leaving them in made "still owed" grow every time a worker was removed
+  mid-balance.
+- `wages_paid`, `wages_earned`, `balance` and every analytics bucket cover
+  **everyone**, removed workers included. The advance was handed over; the cash
+  left the tin. Dropping it would make the balance claim money that is not
+  there.
+
+A genuine erasure is `DELETE /contractor/workers/{id}?purge=true`, which the API
+refuses the moment any history exists. When it does apply, every FK to
+`users.id` is `ON DELETE CASCADE`, so nothing is left orphaned.
+
+### Sites
+
+The jobs a contractor is running. Reads are open to an assigned supervisor;
+writes are admin only.
+
+| Method | Path | Body / Query | Returns |
+| --- | --- | --- | --- |
+| GET | `/contractor/sites` | `?include_inactive` | sites, with worker and photo counts |
+| POST | `/contractor/sites` | `name, address?` | 201 + the site |
+| GET | `/contractor/sites/{id}` | — | one site |
+| PATCH | `/contractor/sites/{id}` | `name?, address?, is_active?, supervisor_id?` | the site |
+| DELETE | `/contractor/sites/{id}` | `?purge` | 204 |
+
+**Deleting a site.** `DELETE` **closes** by default — `is_active` goes false,
+the supervisor is released, and the site drops out of the list and the pickers
+while everything on it is kept. That is the same shape as removing a worker, and
+for the same reason: almost everything on a site (photos, petty cash, tools,
+inventory, material receipts, machinery logs, invoices) hangs off `sites.id`
+with `ON DELETE CASCADE`, so erasing a site that ran for a season erases the
+season, including an invoice already sent to the client.
+
+`?purge=true` is the undo for a site named wrong a minute ago. It is refused
+with a 409 naming the counts the moment anything is on record.
+
+What survives a purge is what is not the site's to delete: workers posted there
+are unposted (`users.site_id` is `SET NULL`), and attendance and piece-rate rows
+keep their history with a null `site_id` — the wage they earned is in the
+worker's ledger and must not move because a site was tidied up.
+
+The app asks the contractor one question and tries `purge` first, falling back
+to a close on the 409. Whether erasing is safe is the server's call, made
+against counts the screen does not hold.
 
 ### Site logistics, piece rate and tools (Phase 10)
 
