@@ -483,6 +483,88 @@ def edit_attendance(
     return attendance
 
 
+@router.delete("/attendance/{attendance_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_attendance(
+    attendance_id: int,
+    staff: CurrentSiteStaff,
+    db: DbSession,
+) -> Response:
+    """Unmark a day that should never have been marked at all.
+
+    WHY A CORRECTION IS NOT ENOUGH
+    ------------------------------
+    `edit_attendance` fixes a day that happened and was recorded wrong. It
+    cannot express the other mistake: a day that did not happen to this worker
+    at all - the wrong name tapped in the grid, a whole crew marked against a
+    site that stood down. Correcting that to `absent` is not the truth either,
+    because absent is a statement about somebody who was expected; it keeps the
+    worker on the roster for a day they were never on.
+
+    So this removes the row. Like `remove_transaction` and unlike
+    `remove_worker`, there is no deactivate-instead split to make: either the
+    day happened or the tap was a mistake, and a mistake has no history worth
+    keeping.
+
+    WHAT IT GIVES BACK
+    ------------------
+    A day marked present under an active plan took that day's deduction. The
+    row going away has to hand it back, or the worker keeps paying an
+    installment for a day that is no longer on the books. Done through
+    `_resettle_installment` with the same day as both the old and the new date
+    and `ABSENT` as the new status, which is exactly "delete this day's
+    installment and apply nothing in its place" - the one path that moves
+    `balance_remaining` through `recompute_balance` rather than by arithmetic.
+
+    WHAT IT REFUSES
+    ---------------
+    A day that paid piece-rate wages is not an empty mark. The log wrote a WAGE
+    `Transaction` in the same DB transaction, so deleting the attendance would
+    leave money paid for a day the worker is no longer recorded as having
+    worked. Refused with a 409 naming the log, matching `remove_transaction`:
+    the caller is told what to unwind first rather than left with a ledger that
+    does not add up.
+    """
+    attendance = db.get(Attendance, attendance_id)
+    if attendance is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attendance record not found"
+        )
+    # Ownership through the worker, and the same 404 above for a row belonging
+    # to another contractor's crew - a 403 would confirm it exists.
+    worker = require_site_worker(db, staff, attendance.worker_id)
+
+    if db.scalar(
+        select(PieceRateLog.id)
+        .where(
+            PieceRateLog.worker_id == attendance.worker_id,
+            PieceRateLog.date == attendance.date,
+        )
+        .limit(1)
+    ) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This day paid piece-rate wages - delete the piece-rate log first"
+            ),
+        )
+
+    day = attendance.date
+    old_status = attendance.status
+
+    db.delete(attendance)
+    # Flushed before the installment work for the same reason the edit is:
+    # `apply_installment` runs inside a SAVEPOINT, and anything surfacing from
+    # this delete in there would be caught by the wrong handler.
+    db.flush()
+
+    _resettle_installment(
+        db, worker.id, day, old_status, day, AttendanceStatus.ABSENT
+    )
+
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.post(
     "/transactions", response_model=TransactionRead, status_code=status.HTTP_201_CREATED
 )

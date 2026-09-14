@@ -69,6 +69,7 @@ contractor routes reject workers and vice versa with a 403.
 | GET | `/contractor/workers` | — | this contractor's crew |
 | POST | `/contractor/attendance` | `worker_id, date, status, note?` | 201 + the attendance row |
 | PATCH | `/contractor/attendance/{id}` | `date?, status?, shift?, note?` | the corrected row |
+| DELETE | `/contractor/attendance/{id}` | — | 204, the day goes back to unmarked |
 | POST | `/contractor/transactions` | `worker_id, type, amount, date, note?` | 201 + the transaction |
 | GET | `/contractor/workers/{id}/ledger` | `?start_date&end_date` | that worker's ledger |
 
@@ -93,6 +94,20 @@ contractor deliberately closed would be the worse mistake.
 Moving a row onto a date the worker is already marked for is a 409 — merging
 two days into one is not this endpoint's call. Piece-rate wages are untouched:
 they are paid on quantity × rate, not on a status.
+
+**Unmarking a day.** `DELETE /contractor/attendance/{id}` removes the row
+entirely. It answers the mistake a correction cannot: the day did not happen to
+this worker at all — the wrong name was tapped in the grid. Correcting that to
+`absent` is a different untruth, because absent is a statement about somebody
+who was expected, and it would leave the date occupied so the worker who *was*
+there still could not be marked.
+
+Same access as the correction above, and the same 404 for another contractor's
+row. A deleted day hands back the installment it took, through the same
+delete-and-re-apply path. A day that paid **piece-rate wages is refused with a
+409** naming the log: the wage was written in the log's own DB transaction, so
+dropping the attendance would leave money paid for a day nobody is recorded as
+having worked. Remove the piece-rate log first.
 
 ### Cash box (Phase 5)
 
