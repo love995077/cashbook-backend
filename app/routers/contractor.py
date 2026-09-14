@@ -555,6 +555,66 @@ def log_transaction(
     return _read_transaction(transaction, deduction)
 
 
+@router.delete("/transactions/{transaction_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_transaction(
+    transaction_id: int, contractor: CurrentContractor, db: DbSession
+) -> Response:
+    """Undo a mistyped ledger entry.
+
+    WHY THIS DELETES INSTEAD OF DEACTIVATING
+    ----------------------------------------
+    A worker is deactivated because "off my crew" and "never paid" are
+    different claims (see `remove_worker`). A transaction has no such split:
+    either the money moved or the number was a typo. A typo has no history
+    worth preserving, and leaving it visible-but-flagged would keep it in
+    every total, which is the thing being complained about.
+
+    WHAT IS REFUSED, AND WHY
+    ------------------------
+    A transaction other rows were built on is not a typo, it is a record with
+    dependents:
+
+      * an `AutoDeduction` plan - the installments already taken off this
+        worker's daily wage were calculated from this advance. Dropping the
+        advance leaves the deductions collecting against nothing.
+      * an `AdvanceRequest` the worker raised and the contractor approved -
+        deleting the payout silently reopens a settled request.
+      * a `PieceRateLog` wage, which a log writes in its own DB transaction so
+        piece work lands in the same balance as everything else. The wage is
+        not editable apart from the work it paid for; delete the log.
+
+    Each is refused with a 409 naming the dependent, so the caller is told
+    what to unwind first rather than being left with a corrupted ledger.
+    """
+    transaction = db.get(Transaction, transaction_id)
+    # Ownership is checked through the worker: a transaction belonging to
+    # another contractor's crew answers 404, never 403, so this cannot be used
+    # to probe for the existence of somebody else's ledger rows.
+    if transaction is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found"
+        )
+    _get_own_worker(db, contractor, transaction.worker_id)
+
+    blockers = (
+        (AutoDeduction, "an instalment plan"),
+        (AdvanceRequest, "an advance request"),
+        (PieceRateLog, "a piece-rate log"),
+    )
+    for model, describe in blockers:
+        if db.scalar(
+            select(model.id).where(model.transaction_id == transaction.id).limit(1)
+        ) is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"This entry is backed by {describe} - remove that first",
+            )
+
+    db.delete(transaction)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get("/workers/{worker_id}/ledger", response_model=WorkerLedger)
 def read_worker_ledger(
     worker_id: int,
