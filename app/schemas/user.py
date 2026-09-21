@@ -129,6 +129,44 @@ class WorkerUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
+class WorkerReplace(BaseModel):
+    """The whole of an edit form, saved at once — PUT rather than PATCH.
+
+    WHY A SECOND SHAPE INSTEAD OF REUSING WorkerUpdate
+    --------------------------------------------------
+    `WorkerUpdate` reads `exclude_unset`, so a field left out means "leave it
+    alone". That is right for the one-field writes the app already makes -
+    posting a worker to a site, deactivating one - and wrong for an edit
+    screen, where clearing the day rate and never touching the day rate are
+    different intentions that both arrive as an absent value.
+
+    Here an omitted field means "make it empty", which is what replacing a
+    record means and what lets the form clear a wage that was typed by
+    mistake. `name` is the one exception: it is the only thing a worker record
+    cannot be without, so it stays required.
+
+    `phone` and `role` are deliberately still absent, for the reason
+    `WorkerUpdate` gives - the number somebody signs in with is not a detail
+    on a form.
+
+    ON THE DAY RATE AND HISTORY
+    ---------------------------
+    Changing `daily_wage` does NOT reprice days already worked. Attendance
+    writes its wage as a `Transaction` at the rate of the day (see
+    app/services/wages.py), so raising someone's rate pays the new rate from
+    here on and leaves last month's books saying what they actually said.
+    """
+
+    name: Name
+    daily_wage: Optional[Decimal] = Field(
+        default=None, ge=0, max_digits=10, decimal_places=2
+    )
+    trade: Trade = None
+    wage_type: WageType = WageType.DAILY
+    site_id: Optional[int] = Field(default=None, ge=0)
+    is_active: bool = True
+
+
 class UserUpdate(BaseModel):
     """All fields optional — only the supplied ones are changed."""
 

@@ -19,6 +19,7 @@ from app.models.enums import AttendanceStatus, WorkShift
 
 if TYPE_CHECKING:
     from app.models.site import Site
+    from app.models.transaction import Transaction
     from app.models.user import User
 
 
@@ -62,6 +63,33 @@ class Attendance(Base):
 
     note: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
+    # The WAGE `Transaction` this day earned, for a worker on a day rate.
+    #
+    # WHY THE LINK IS STORED RATHER THAN RECOMPUTED
+    # ---------------------------------------------
+    # Marking a day present is what earns a daily worker their wage, the same
+    # way a piece-rate log earns one (`piece_rate_logs.transaction_id`). The
+    # row has to be reversible: correcting a day to absent takes the wage
+    # back, and unmarking it removes the wage entirely.
+    #
+    # Finding that wage by (worker_id, date) instead would be indistinguishable
+    # from one the contractor typed by hand on the same day, so an edit could
+    # silently delete money somebody entered deliberately. The explicit link is
+    # the only thing that says "this row created that row".
+    #
+    # NULL is ordinary, not a gap: absent and rain-out earn nothing, a
+    # piece-rate worker is paid by their log instead, and a worker with no
+    # `daily_wage` set has no figure to earn.
+    #
+    # SET NULL rather than CASCADE - deleting the wage must not delete the
+    # record that the worker turned up. `remove_transaction` refuses to delete
+    # an attendance-backed wage anyway; correct the day instead.
+    transaction_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("transactions.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+    )
+
     # Raised by the worker when the row does not match the day they worked.
     # It does not change the status or the balance - it is a flag that says
     # "come and look at this", cleared by the contractor once settled in
@@ -81,6 +109,7 @@ class Attendance(Base):
     )
 
     worker: Mapped["User"] = relationship(back_populates="attendances")
+    transaction: Mapped[Optional["Transaction"]] = relationship()
     site: Mapped[Optional["Site"]] = relationship(back_populates="attendances")
 
     def __repr__(self) -> str:

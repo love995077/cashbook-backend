@@ -59,6 +59,7 @@ from app.services.storage import (
     public_url,
     store_upload,
 )
+from app.services.wages import sync_attendance_wage
 
 router = APIRouter(prefix="/contractor/sites", tags=["sites"])
 settings = get_settings()
@@ -590,6 +591,10 @@ def mark_site_rained_out(
             row.status = AttendanceStatus.RAIN_OUT
             if row.site_id is None:
                 row.site_id = site.id
+            # A day that was marked present had earned its wage. The site
+            # standing down takes that back, or the crew is paid for a day
+            # the weather cancelled - see app/services/wages.py.
+            sync_attendance_wage(db, row, worker)
             updated += 1
         else:
             unchanged += 1

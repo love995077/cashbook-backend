@@ -55,7 +55,7 @@ from app.schemas.cash import (
 from app.schemas.ledger import WorkerLedger
 from app.schemas.piece_rate import PieceRateLogRead
 from app.schemas.transaction import TransactionCreate, TransactionRead
-from app.schemas.user import UserRead, WorkerCreate, WorkerUpdate
+from app.schemas.user import UserRead, WorkerCreate, WorkerReplace, WorkerUpdate
 from app.services.cash import (
     build_series,
     build_summary,
@@ -63,6 +63,7 @@ from app.services.cash import (
 )
 from app.routers.piece_rate import build_piece_rate_log, ensure_no_active_plan
 from app.services.deductions import active_plans, apply_installment, recompute_balance
+from app.services.wages import clear_attendance_wage, sync_attendance_wage
 from app.services.ledger import build_worker_ledger, calculate_balance
 from app.services.storage import public_url
 from app.services.notifications import notify_transaction, should_notify
@@ -236,6 +237,45 @@ def edit_worker(
     return worker
 
 
+@router.put("/workers/{worker_id}", response_model=UserRead)
+def replace_worker(
+    worker_id: int,
+    payload: WorkerReplace,
+    contractor: CurrentContractor,
+    db: DbSession,
+) -> User:
+    """Save the whole of a worker's edit form.
+
+    The correction route. A name typed wrong on the morning somebody first
+    turned up, a day rate agreed at 600 and entered as 60, a post left blank
+    because nobody had asked yet - all of it was write-once until this
+    existed, and a record you cannot correct is one people stop trusting.
+
+    PUT rather than PATCH because an edit screen sends every field it owns:
+    an absent value here means "empty", not "unchanged", which is the only way
+    the form can CLEAR a wage rather than just overwrite it. `PATCH` is still
+    there for the app's one-field writes. See `WorkerReplace`.
+
+    Days already worked keep the rate they were worked at - changing the wage
+    is not a rewrite of the books. See app/services/wages.py.
+    """
+    worker = _get_own_worker(db, contractor, worker_id)
+
+    worker.name = payload.name
+    worker.daily_wage = payload.daily_wage
+    worker.trade = payload.trade
+    worker.wage_type = payload.wage_type
+    worker.is_active = payload.is_active
+    # Validated rather than assigned straight through: a site belonging to
+    # another contractor answers 404 like everything else here, and 0 is the
+    # form's way of saying "not posted anywhere".
+    worker.site_id = _check_site(db, contractor, payload.site_id)
+
+    db.commit()
+    db.refresh(worker)
+    return worker
+
+
 @router.delete("/workers/{worker_id}", status_code=status.HTTP_204_NO_CONTENT)
 def remove_worker(
     worker_id: int,
@@ -332,8 +372,11 @@ def remove_worker(
 def log_attendance(
     payload: AttendanceCreate, contractor: CurrentContractor, db: DbSession
 ) -> Attendance:
-    """Record one day's attendance for a worker."""
-    _get_own_worker(db, contractor, payload.worker_id)
+    """Record one day's attendance for a worker.
+
+    A day that earns a wage writes it here - see app/services/wages.py.
+    """
+    worker = _get_own_worker(db, contractor, payload.worker_id)
 
     attendance = Attendance(
         worker_id=payload.worker_id,
@@ -344,7 +387,9 @@ def log_attendance(
     )
     db.add(attendance)
     try:
-        db.commit()
+        # Flushed rather than committed, so the wage below joins this row in
+        # one transaction: a day and the money it earned land together.
+        db.flush()
     except IntegrityError:
         # One attendance row per worker per day (uq_attendance_worker_date).
         db.rollback()
@@ -352,6 +397,10 @@ def log_attendance(
             status_code=status.HTTP_409_CONFLICT,
             detail="Attendance for this worker on this date has already been logged",
         ) from None
+
+    sync_attendance_wage(db, attendance, worker)
+
+    db.commit()
     db.refresh(attendance)
     return attendance
 
@@ -477,6 +526,9 @@ def edit_attendance(
     _resettle_installment(
         db, worker.id, old_date, old_status, attendance.date, attendance.status
     )
+    # The day's wage follows the day: corrected to absent it is taken back,
+    # to a half day it is halved, and moved to another date it moves with it.
+    sync_attendance_wage(db, attendance, worker)
 
     db.commit()
     db.refresh(attendance)
@@ -550,6 +602,9 @@ def remove_attendance(
 
     day = attendance.date
     old_status = attendance.status
+
+    # Before the delete, while the link is still readable.
+    clear_attendance_wage(db, attendance)
 
     db.delete(attendance)
     # Flushed before the installment work for the same reason the edit is:
@@ -682,6 +737,12 @@ def remove_transaction(
         (AutoDeduction, "an instalment plan"),
         (AdvanceRequest, "an advance request"),
         (PieceRateLog, "a piece-rate log"),
+        # A day's wage, written by marking attendance. Deleting it here would
+        # leave the day on the books earning nothing, and the next edit to
+        # that day would silently write the wage back - so the correction has
+        # to be made where it belongs: unmark the day, or correct it to
+        # absent. See app/services/wages.py.
+        (Attendance, "a day of attendance"),
     )
     for model, describe in blockers:
         if db.scalar(
@@ -854,6 +915,13 @@ def log_bulk_attendance(
             db.add(log)
             logs.append(log)
 
+        # The day's wage, for a worker on a day rate. Called for an unchanged
+        # row too: `sync_attendance_wage` is idempotent, so a resubmitted grid
+        # settles on the same single wage rather than paying twice. Piece-rate
+        # rows are skipped inside it - their log above already paid them.
+        db.flush()
+        sync_attendance_wage(db, row, worker)
+
         plan = plans.get(worker.id)
         if plan is not None:
             # Safe to call for an unchanged row too: the unique constraint on
@@ -933,6 +1001,9 @@ def scan_attendance(
             attendance.site_id = worker.site_id
 
     try:
+        # Flushed first so the wage joins the scan in one transaction.
+        db.flush()
+        sync_attendance_wage(db, attendance, worker)
         db.commit()
     except IntegrityError:
         # Two scans of the same badge racing each other. The row that won is
