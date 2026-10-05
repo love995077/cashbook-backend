@@ -21,6 +21,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
+from app.core.clock import business_today
 from app.dependencies import (
     CurrentContractor,
     DbSession,
@@ -39,6 +40,7 @@ from app.schemas.deduction import (
     DeductionInstallmentRead,
 )
 from app.schemas.piece_rate import PieceRateLogCreate, PieceRateLogRead
+from app.services.attendance import check_markable
 from app.services.deductions import recompute_balance
 from app.services.ledger import CENTS
 
@@ -81,6 +83,8 @@ def build_piece_rate_log(
         type=TransactionType.WAGE,
         amount=total,
         date=when,
+        # Where the work was done, the same site the log records.
+        site_id=site_id,
         # No payment_mode: a wage is money earned, not money handed over. The
         # transactions endpoint enforces the same rule.
         note=(note or f"{work_description} — {quantity} x {rate}")[:255],
@@ -145,12 +149,15 @@ def add_piece_rate_log(
     """Log a measured piece of work, and the wage it earned."""
     worker = require_own_worker(db, contractor, payload.worker_id)
 
-    when = payload.date or date_type.today()
-    if when > date_type.today():
+    when = payload.date or business_today()
+    if when > business_today():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Work cannot be logged before it has been done",
         )
+    # A worker taken off the crew earns nothing for days after they left -
+    # the same rule the attendance grid applies. See `check_markable`.
+    check_markable(worker, when)
 
     site_id = payload.site_id
     if site_id is not None:

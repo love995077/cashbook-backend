@@ -122,6 +122,8 @@ class CashSummary(BaseModel):
     worker_count: int
     start_date: Optional[date_type] = None
     end_date: Optional[date_type] = None
+    # The site these figures are for; null for the whole business.
+    site_id: Optional[int] = None
 
 
 class AnalyticsBucket(BaseModel):

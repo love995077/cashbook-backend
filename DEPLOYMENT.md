@@ -1,179 +1,128 @@
 # Deployment
 
-Backend runs as two containers (MySQL + the API behind gunicorn). The mobile
-app is built by EAS.
+Production runs on the Oracle Cloud server (`ssh oracle` = `ubuntu@137.23.45.178`,
+aarch64) as an isolated Docker Compose project in `~/moneymate-backend`:
+
+| Service   | What it is                                   | Reachable at                     |
+| --------- | -------------------------------------------- | -------------------------------- |
+| `db`      | PostgreSQL 16                                | host loopback `127.0.0.1:15432`  |
+| `migrate` | one-shot `alembic upgrade head`, then exits  | —                                |
+| `api`     | FastAPI behind gunicorn/uvicorn              | host loopback `127.0.0.1:8010`   |
+
+TLS and the public name `https://moneymate.lovee.dpdns.org` come from the
+server's existing Caddy (the `loveedpdnsorg-caddy-1` container, host network),
+which proxies that SNI name to `localhost:8010`. Nothing of MoneyMate listens on
+a public interface.
+
+The mobile app's `preview` and `production` EAS profiles point at
+`https://moneymate.lovee.dpdns.org` (`mobile/eas.json`).
+
+> Render and Aiven MySQL are the previous deployment. The Render service is
+> suspended; the Aiven database is no longer written to.
 
 ---
 
-## Backend
+## Prerequisite: DNS
 
-### First deploy
-
-```bash
-cp .env.production.example .env.production
-# Fill in every CHANGE_ME. Generate the JWT secret with:
-python -c "import secrets; print(secrets.token_urlsafe(48))"
-
-docker compose --env-file .env.production up -d --build
-```
-
-Order is handled by compose: `db` starts and must pass its healthcheck, then
-`migrate` creates the tables and exits, then `api` starts.
+`moneymate.lovee.dpdns.org` needs an **A record → 137.23.45.178** at the DNS
+host for `lovee.dpdns.org` (DigitalPlat: `dns1/dns2.digitalplat.org`). The
+domain has no wildcard; every subdomain is its own record. Caddy obtains the
+certificate by itself once the name resolves.
 
 ```bash
-docker compose --env-file .env.production ps
-docker compose --env-file .env.production logs -f api
-curl -s http://127.0.0.1:8000/health     # {"status":"ok"}
+nslookup moneymate.lovee.dpdns.org 1.1.1.1      # must answer 137.23.45.178
 ```
 
-### Updating
+---
+
+## Updating the server
+
+From the project root on a workstation:
 
 ```bash
-git pull
-docker compose --env-file .env.production up -d --build
+tar --exclude='__pycache__' -czf moneymate-backend.tgz \
+    app alembic alembic.ini scripts Dockerfile docker-compose.yml \
+    gunicorn.conf.py requirements.txt .dockerignore .env.production.example README.md
+scp moneymate-backend.tgz oracle:/tmp/
+ssh oracle 'tar -xzf /tmp/moneymate-backend.tgz -C ~/moneymate-backend && rm /tmp/moneymate-backend.tgz \
+            && cd ~/moneymate-backend && docker compose up -d --build'
 ```
 
-`migrate` re-runs on each `up`. That is safe — `create_all` only creates
-missing tables — but see the migrations note below.
+`migrate` runs before the API on every `up`, so a new migration is applied by
+the same command - and against exactly the code that is about to serve.
 
-### Migrations
-
-`scripts/create_tables.py` creates tables that do not exist. **It never alters
-one that does.** Adding a column to a model will not change the live database;
-the change has to be applied by hand:
+Check it:
 
 ```bash
-docker compose --env-file .env.production exec db \
-  mysql -u root -p"$MYSQL_ROOT_PASSWORD" cash_book \
-  -e "ALTER TABLE transactions ADD COLUMN client_ref VARCHAR(64) NULL UNIQUE;"
+ssh oracle 'cd ~/moneymate-backend && docker compose ps && curl -s localhost:8010/health'
+python scripts/smoke_deployed.py https://moneymate.lovee.dpdns.org   # writes a throwaway account
 ```
 
-This is the point to adopt Alembic. Once it is in, swap the `migrate` service's
-command to `alembic upgrade head` and this problem goes away.
+## Secrets
 
-### Backups
+`~/moneymate-backend/.env` (mode 600) was generated on the server with
+`openssl rand` and has never left it. Template: `.env.production.example`.
 
-The database lives in the `cashbook_db_data` volume. Nothing else is stateful.
+- `POSTGRES_PASSWORD` is hex so it is safe inside the `DATABASE_URL` compose
+  builds from it.
+- `JWT_SECRET` signs every session; rotating it signs everybody out.
+- The image contains no secrets (`.dockerignore` keeps env files out).
+
+## Backups
+
+`scripts/backup_postgres.sh` dumps the database to
+`~/moneymate-backend/backups/` (mode 700, files 600) and keeps 14 days. A
+systemd timer runs it nightly at 20:45 UTC (02:15 IST):
 
 ```bash
-# Dump
-docker compose --env-file .env.production exec -T db \
-  mysqldump -u root -p"$MYSQL_ROOT_PASSWORD" --single-transaction cash_book \
-  > backup-$(date +%F).sql
-
-# Restore
-docker compose --env-file .env.production exec -T db \
-  mysql -u root -p"$MYSQL_ROOT_PASSWORD" cash_book < backup-2026-09-03.sql
+ssh oracle 'systemctl list-timers moneymate-backup.timer; ls -la ~/moneymate-backend/backups'
 ```
 
-### Before this faces the internet
+Restore into an EMPTY database:
 
-- **Terminate TLS in front of it.** The API binds to `127.0.0.1:8000`, so it is
-  not reachable from outside the host as configured. Put nginx/Caddy or a load
-  balancer in front. The app stores a JWT — sending it over plain HTTP hands it
-  to anyone on the path.
-- **Set `CORS_ORIGINS`** to the real origins. `*` is the development default.
-- **Do not publish the `db` port.** It is commented out in
-  `docker-compose.yml`; leave it that way unless you specifically need a GUI
-  client, and bind it to `127.0.0.1` if you do.
-- **`JWT_SECRET` is per environment.** Rotating it logs every user out.
+```bash
+gunzip -c backups/<file>.sql.gz | docker compose exec -T db psql -U moneymate -d moneymate
+```
 
-### Secret handling
+Copy backups off the server now and then - a disk is not a backup of itself.
 
-- The image contains no secrets: `.dockerignore` keeps env files out of the
-  build context and the Dockerfile copies none.
-- Values are injected at run time by compose from `--env-file`.
-- `.env` (development) and `.env.production` are both gitignored; the
-  `.example` files are the templates and are committed.
-- Compose fails loudly rather than defaulting when `MYSQL_ROOT_PASSWORD`,
-  `DB_USER`, `DB_PASSWORD` or `JWT_SECRET` is missing.
-- MySQL's root password and the app's `DB_PASSWORD` are separate. The app
-  account should have rights to `cash_book` only.
+## Caddy
+
+The route lives in `~/lovee.dpdns.org/caddy.yaml` (root-owned, shared with the
+other apps on the server). The MoneyMate change was purely additive - one name in
+`tls.certificates.automate`, one SNI route to `localhost:8010` - and the file
+before it is kept as `caddy.yaml.bak-moneymate-<timestamp>`. Always validate
+before reloading, because one bad file takes every site on the server down:
+
+```bash
+docker exec loveedpdnsorg-caddy-1 caddy validate --config /etc/caddy.yaml --adapter yaml
+docker exec loveedpdnsorg-caddy-1 caddy reload   --config /etc/caddy.yaml --adapter yaml
+```
+
+## Moving data from the old MySQL database
+
+Not used for this cutover (the client started from an empty database), but
+kept and tested (`tests/test_data_copy.py`):
+
+```bash
+python scripts/migrate_mysql_to_postgres.py --source <mysql url> --source-ssl --target <postgres url>          # dry run
+python scripts/migrate_mysql_to_postgres.py --source <mysql url> --source-ssl --target <postgres url> --apply
+```
+
+It builds the target at the source's Alembic revision, copies every row with
+its id, moves the sequences on, upgrades to head (so the newer back-fills run
+over real data) and compares row counts and money totals table by table.
 
 ---
 
 ## Mobile app
 
-### One-time setup
-
-```bash
-npm install -g eas-cli
-eas login
-cd mobile
-eas init          # creates the EAS project and writes extra.eas.projectId
-```
-
-`eas init` is required before any build — it links this app to your Expo
-account. It is the one step that cannot be done ahead of time here.
-
-### Point the build at your API
-
-`eas.json` carries `EXPO_PUBLIC_API_URL` per profile, and the placeholder
-values must be replaced:
-
-| Profile | Currently | Set it to |
-| --- | --- | --- |
-| `development` | `http://192.168.29.10:8000` | your machine's LAN IP |
-| `preview` | `https://staging-api.example.com` | your staging URL |
-| `production` | `https://api.example.com` | your production URL |
-
-This matters more than it looks. `src/api/client.ts` falls back to a LAN IP
-when nothing else is set, and in a release build there is no Metro host to
-infer one from — so an unset value ships an app that points at a private
-address and simply cannot connect.
-
-**Preview and production must be `https`.** Android blocks cleartext HTTP in
-release builds (verified against the generated manifest: cleartext is enabled
-only in the debug variant). A `preview` APK pointed at `http://` will fail
-every request with no obvious explanation.
-
-### Android builds
-
 ```bash
 cd mobile
-
-# Installable APK for a physical device — this is the one for testing.
-eas build -p android --profile preview
-
-# Play Store bundle (.aab)
-eas build -p android --profile production
-
-# Dev client for day-to-day work against a local backend
-eas build -p android --profile development
+eas build -p android --profile preview      # installable APK
+eas build -p android --profile production   # Play Store bundle
 ```
 
-The build runs on EAS servers; the CLI prints a URL to follow it, and a
-download link when it finishes. First run asks to generate an Android keystore
-— say yes and let EAS hold it, unless you already have one.
-
-Install the APK on a device:
-
-```bash
-# From the download link, or straight over adb:
-eas build:run -p android --latest
-# or
-adb install ~/Downloads/build-xxxx.apk
-```
-
-An `.aab` cannot be installed directly on a phone — it is for the Play Store.
-Use the `preview` profile for anything you want to sideload.
-
-### Useful follow-ups
-
-```bash
-eas build:list                       # history and status
-eas build:view                       # detail for one build
-eas submit -p android --latest       # upload the .aab to Play (internal track)
-eas build -p android --profile preview --local   # build on this machine
-```
-
-### Version numbers
-
-`cli.appVersionSource` is `remote`, so EAS owns the build number and
-`production` has `autoIncrement` on — `versionCode` goes up on its own. The
-user-facing `version` in `app.json` ("1.0.0") is yours to bump.
-
-### iOS
-
-`ios.bundleIdentifier` is set, so `eas build -p ios` will work, but it needs a
-paid Apple Developer account. Nothing here has been exercised against one.
+`app.json`'s `slug` must stay `cashbook` - it is what the EAS project id is
+registered under. `preview` and `production` must be `https`: Android blocks
+cleartext HTTP in release builds.

@@ -42,6 +42,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from app.core.migration_support import enum_type, ensure_enum, is_postgres
+
 # revision identifiers, used by Alembic.
 revision: str = 'b7e2c9d41a83'
 down_revision: Union[str, Sequence[str], None] = '225a41e86ef9'
@@ -71,13 +73,28 @@ def upgrade() -> None:
     """Upgrade schema."""
     # ENUM -> VARCHAR. MySQL rewrites each row as its label, which is already
     # the normalised form the app now stores, so nothing needs converting.
-    op.alter_column(
-        'users',
-        'trade',
-        existing_type=WORKER_TRADE,
-        type_=sa.String(length=50),
-        existing_nullable=True,
-    )
+    #
+    # PostgreSQL will not cast an enum to text implicitly, so it is told how:
+    # `trade::text` is the label, which is the same string MySQL writes. The
+    # type is then dropped, because nothing references it any more.
+    if is_postgres():
+        op.alter_column(
+            'users',
+            'trade',
+            existing_type=enum_type('worker_trade', *WORKER_TRADE.enums),
+            type_=sa.String(length=50),
+            existing_nullable=True,
+            postgresql_using='trade::text',
+        )
+        op.execute('DROP TYPE IF EXISTS worker_trade')
+    else:
+        op.alter_column(
+            'users',
+            'trade',
+            existing_type=WORKER_TRADE,
+            type_=sa.String(length=50),
+            existing_nullable=True,
+        )
 
     # Dropping NOT NULL. The unique index on `phone` is left exactly as it is;
     # altering nullability does not disturb it.
@@ -120,10 +137,21 @@ def downgrade() -> None:
         existing_type=sa.String(length=20),
         nullable=False,
     )
-    op.alter_column(
-        'users',
-        'trade',
-        existing_type=sa.String(length=50),
-        type_=WORKER_TRADE,
-        existing_nullable=True,
-    )
+    if is_postgres():
+        ensure_enum('worker_trade', *WORKER_TRADE.enums)
+        op.alter_column(
+            'users',
+            'trade',
+            existing_type=sa.String(length=50),
+            type_=enum_type('worker_trade', *WORKER_TRADE.enums),
+            existing_nullable=True,
+            postgresql_using='trade::worker_trade',
+        )
+    else:
+        op.alter_column(
+            'users',
+            'trade',
+            existing_type=sa.String(length=50),
+            type_=WORKER_TRADE,
+            existing_nullable=True,
+        )

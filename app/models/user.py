@@ -1,8 +1,9 @@
+from datetime import date as date_type
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Numeric, String, func
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -29,9 +30,9 @@ class User(Base):
     # recording, and refusing to book them until one exists is how a crew list
     # stops matching the crew.
     #
-    # Still UNIQUE, and MySQL permits any number of NULLs in a unique index, so
-    # the constraint keeps doing its real job — no two accounts share a number —
-    # without forcing one to exist. A worker with no phone simply has no way to
+    # Still UNIQUE, and both MySQL and PostgreSQL permit any number of NULLs in
+    # a unique index, so the constraint keeps doing its real job — no two
+    # accounts share a number — without forcing one to exist. A worker with no phone simply has no way to
     # sign in; they are a record their contractor keeps, not an account.
     phone: Mapped[Optional[str]] = mapped_column(
         String(20), unique=True, index=True, nullable=True
@@ -93,11 +94,38 @@ class User(Base):
     # Which site this worker is currently assigned to. Optional: a worker can
     # be on the crew before a site exists, and contractors running a single job
     # never need sites at all.
+    #
+    # `use_alter`: users and sites reference each other, so neither CREATE
+    # TABLE can carry this constraint - it is added by ALTER once both exist,
+    # exactly as the initial migration does, and under the same name.
     site_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("sites.id", ondelete="SET NULL"), nullable=True, index=True
+        ForeignKey(
+            "sites.id",
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_users_site_id_sites",
+        ),
+        nullable=True,
+        index=True,
     )
 
+    # Deactivation is the "remove from crew" of this app: the row and its
+    # ledger survive, the worker drops out of the crew list and the
+    # attendance grid. See `remove_worker`.
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # The first day the worker no longer works here, set when they are
+    # deactivated and cleared when they come back.
+    #
+    # A flag alone cannot answer "may this day be marked?". A worker who left
+    # on the 20th worked the 18th, and the 18th may still need marking - back-
+    # dated from a paper register, or replayed from a phone that was offline.
+    # Refusing every mark for an inactive worker would lose those days; allowing
+    # every mark would let a deactivated worker keep earning. So days BEFORE
+    # this date may be marked and days on or after it are refused. NULL with
+    # is_active false is a worker deactivated before this column existed, and
+    # is treated as "no new days at all".
+    deactivated_on: Mapped[Optional[date_type]] = mapped_column(Date, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False

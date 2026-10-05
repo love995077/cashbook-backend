@@ -30,6 +30,8 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
+from app.core.migration_support import enum_type, ensure_enum, is_postgres
+
 
 # revision identifiers, used by Alembic.
 revision: str = '0fba0f954fb6'
@@ -40,11 +42,13 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema."""
+    # add_column never creates a PostgreSQL enum type. No-op on MySQL.
+    ensure_enum('work_shift', 'day', 'night')
     op.add_column(
         'attendance',
         sa.Column(
             'shift',
-            sa.Enum('day', 'night', name='work_shift'),
+            enum_type('work_shift', 'day', 'night'),
             # Backfills every existing row. Every day marked before this
             # column existed was worked in daylight - a fact, not a guess.
             server_default='day',
@@ -60,3 +64,5 @@ def downgrade() -> None:
     # Lossy: which rows were night shifts is not recoverable afterwards.
     op.drop_index(op.f('ix_attendance_shift'), table_name='attendance')
     op.drop_column('attendance', 'shift')
+    if is_postgres():
+        op.execute('DROP TYPE IF EXISTS work_shift')

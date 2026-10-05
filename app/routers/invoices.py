@@ -28,6 +28,7 @@ from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.clock import business_today
 from app.dependencies import CurrentContractor, DbSession, require_own_site
 from app.models.cash import CashCategory, CashEntry
 from app.models.enums import CashDirection, InvoiceStatus
@@ -228,7 +229,7 @@ def preview_invoice(
     and watch the figure change before committing to one.
     """
     site = require_own_site(db, contractor, site_id)
-    until = end_date or date_type.today()
+    until = end_date or business_today()
     if start_date is not None and start_date > until:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -391,10 +392,10 @@ def invoice_pdf(
             status_code=status.HTTP_404_NOT_FOUND, detail="Site not found"
         )
 
-    until = end_date or date_type.today()
+    until = end_date or business_today()
     preview = _build_preview(db, site, start_date, until)
 
-    today = date_type.today()
+    today = business_today()
     pdf = build_invoice(
         invoice=invoice,
         site=site,

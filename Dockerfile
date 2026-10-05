@@ -23,7 +23,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Copied on its own so the layer is reused whenever only source code changes.
 COPY requirements.txt .
-RUN pip install --require-hashes=false -r requirements.txt \
+RUN pip install -r requirements.txt \
     && pip install "gunicorn>=23.0.0"
 
 # ---------------------------------------------------------------- runtime ---
@@ -43,7 +43,15 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=cashbook:cashbook app/ ./app/
 COPY --chown=cashbook:cashbook scripts/ ./scripts/
-COPY --chown=cashbook:cashbook gunicorn.conf.py ./
+# The migration chain ships in the image, so the one-shot `migrate` service in
+# docker-compose.yml runs `alembic upgrade head` from exactly the code the API
+# is about to run - the schema and the app cannot come from different builds.
+COPY --chown=cashbook:cashbook alembic/ ./alembic/
+COPY --chown=cashbook:cashbook alembic.ini gunicorn.conf.py ./
+
+# Uploaded photos live on a volume mounted here; created now so it belongs to
+# the unprivileged user rather than to root when the volume is first attached.
+RUN mkdir -p /app/media && chown cashbook:cashbook /app/media
 
 USER cashbook
 

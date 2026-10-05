@@ -27,6 +27,7 @@ from typing import Iterable, Literal, Optional
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.clock import business_today
 from app.models.cash import CashCategory, CashEntry
 from app.models.enums import CashDirection, TransactionType, UserRole
 from app.models.transaction import Transaction
@@ -98,7 +99,7 @@ def default_window(period: Period, today: Optional[date_type] = None) -> tuple[d
     Roughly a dozen bars in each mode: two weeks of days, twelve weeks, or a
     year of months.
     """
-    today = today or date_type.today()
+    today = today or business_today()
     if period == "day":
         return today - timedelta(days=13), today
     if period == "week":
@@ -155,7 +156,10 @@ def _buckets_between(start: date_type, end: date_type, period: Period) -> list[d
 
 
 def crew_ids(
-    db: Session, contractor_id: int, active_only: bool = False
+    db: Session,
+    contractor_id: int,
+    active_only: bool = False,
+    site_id: Optional[int] = None,
 ) -> list[int]:
     """This contractor's workers.
 
@@ -176,12 +180,17 @@ def crew_ids(
 
     Passing the flag at each call site rather than filtering here is what keeps
     those two apart.
+
+    `site_id` narrows to the workers posted there now - the crew a site's
+    "still owed" and head count are about.
     """
     stmt = select(User.id).where(
         User.contractor_id == contractor_id, User.role == UserRole.WORKER
     )
     if active_only:
         stmt = stmt.where(User.is_active.is_(True))
+    if site_id is not None:
+        stmt = stmt.where(User.site_id == site_id)
     return list(db.scalars(stmt).all())
 
 
@@ -190,6 +199,7 @@ def _worker_rows(
     crew: Iterable[int],
     start: Optional[date_type],
     end: Optional[date_type],
+    site_id: Optional[int] = None,
 ) -> list[tuple[date_type, TransactionType, Decimal]]:
     crew = list(crew)
     if not crew:
@@ -197,6 +207,11 @@ def _worker_rows(
     stmt = select(Transaction.date, Transaction.type, Transaction.amount).where(
         Transaction.worker_id.in_(crew)
     )
+    if site_id is not None:
+        # The site the money is attributed to, stamped on the row - not where
+        # the worker happens to be posted today. A mason moved to another job
+        # keeps every rupee earned here on this site's books.
+        stmt = stmt.where(Transaction.site_id == site_id)
     if start is not None:
         stmt = stmt.where(Transaction.date >= start)
     if end is not None:
@@ -209,10 +224,13 @@ def _cash_rows(
     contractor_id: int,
     start: Optional[date_type],
     end: Optional[date_type],
+    site_id: Optional[int] = None,
 ) -> list[tuple[date_type, CashDirection, Decimal, Optional[int]]]:
     stmt = select(
         CashEntry.date, CashEntry.direction, CashEntry.amount, CashEntry.category_id
     ).where(CashEntry.contractor_id == contractor_id)
+    if site_id is not None:
+        stmt = stmt.where(CashEntry.site_id == site_id)
     if start is not None:
         stmt = stmt.where(CashEntry.date >= start)
     if end is not None:
@@ -220,7 +238,9 @@ def _cash_rows(
     return [(row[0], row[1], _money(row[2]), row[3]) for row in db.execute(stmt).all()]
 
 
-def outstanding_payable(db: Session, contractor_id: int) -> Decimal:
+def outstanding_payable(
+    db: Session, contractor_id: int, site_id: Optional[int] = None
+) -> Decimal:
     """What the contractor still owes, summed over workers who are owed.
 
     Workers in credit (paid ahead) are excluded rather than netted off - one
@@ -231,7 +251,7 @@ def outstanding_payable(db: Session, contractor_id: int) -> Decimal:
     somebody was removed mid-balance — the figure a contractor uses to decide
     what to pay out on Saturday, quietly counting people who left in March.
     """
-    crew = crew_ids(db, contractor_id, active_only=True)
+    crew = crew_ids(db, contractor_id, active_only=True, site_id=site_id)
     if not crew:
         return ZERO
 
@@ -258,15 +278,20 @@ def build_summary(
     contractor_id: int,
     start: Optional[date_type] = None,
     end: Optional[date_type] = None,
+    site_id: Optional[int] = None,
 ) -> CashSummary:
-    """The Home screen numbers for one period (all time when unbounded)."""
+    """The Home screen numbers for one period (all time when unbounded).
+
+    With `site_id`, the same figures for one site: money by the site stamped
+    on each row, "still owed" and the head count by who is posted there now.
+    """
     # The whole crew, removed workers included: see `crew_ids`. Cash that
     # reached somebody who has since left the job still left the cash box.
     crew = crew_ids(db, contractor_id)
 
     wages_earned = ZERO
     wages_paid = ZERO
-    for _day, tx_type, amount in _worker_rows(db, crew, start, end):
+    for _day, tx_type, amount in _worker_rows(db, crew, start, end, site_id):
         if tx_type is TransactionType.WAGE:
             wages_earned += amount
         else:
@@ -274,7 +299,9 @@ def build_summary(
 
     cash_in = ZERO
     expenses_paid = ZERO
-    for _day, direction, amount, _category_id in _cash_rows(db, contractor_id, start, end):
+    for _day, direction, amount, _category_id in _cash_rows(
+        db, contractor_id, start, end, site_id
+    ):
         if direction is CashDirection.IN:
             cash_in += amount
         else:
@@ -289,12 +316,13 @@ def build_summary(
         balance=(cash_in - total_out).quantize(CENTS),
         wages_earned=wages_earned.quantize(CENTS),
         # Always lifetime: what is owed is not a property of a date range.
-        outstanding_payable=outstanding_payable(db, contractor_id),
+        outstanding_payable=outstanding_payable(db, contractor_id, site_id),
         # The crew as it stands today, which is what "across N workers" beside
         # the owed figure is counting — not everyone who ever worked here.
-        worker_count=len(crew_ids(db, contractor_id, active_only=True)),
+        worker_count=len(crew_ids(db, contractor_id, active_only=True, site_id=site_id)),
         start_date=start,
         end_date=end,
+        site_id=site_id,
     )
 
 
@@ -304,6 +332,7 @@ def build_series(
     period: Period,
     start: Optional[date_type] = None,
     end: Optional[date_type] = None,
+    site_id: Optional[int] = None,
 ) -> AnalyticsSeries:
     """Bars for the analytics chart, plus totals and a category breakdown.
 
@@ -317,8 +346,8 @@ def build_series(
         start, end = end, start
 
     crew = crew_ids(db, contractor_id)
-    wage_rows = _worker_rows(db, crew, start, end)
-    cash_rows = _cash_rows(db, contractor_id, start, end)
+    wage_rows = _worker_rows(db, crew, start, end, site_id)
+    cash_rows = _cash_rows(db, contractor_id, start, end, site_id)
 
     starts = _buckets_between(start, end, period)
     wages: dict[date_type, Decimal] = {key: ZERO for key in starts}
@@ -356,7 +385,7 @@ def build_series(
         start_date=start,
         end_date=end,
         buckets=buckets,
-        totals=build_summary(db, contractor_id, start, end),
+        totals=build_summary(db, contractor_id, start, end, site_id),
         by_category=_category_totals(db, contractor_id, per_category),
     )
 

@@ -1,4 +1,6 @@
+from dataclasses import asdict
 from datetime import date as date_type
+from datetime import timedelta
 from decimal import Decimal
 from typing import Literal, Optional
 
@@ -7,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.clock import business_today
 from app.core.security import hash_password
 from app.dependencies import (
     CurrentContractor,
@@ -27,6 +30,7 @@ from app.models.enums import (
     PaymentMode,
     TransactionType,
     UserRole,
+    WageType,
 )
 from app.models.piece_rate import PieceRateLog
 from app.models.site import Site
@@ -52,18 +56,39 @@ from app.schemas.cash import (
     CashEntryUpdate,
     CashSummary,
 )
+from app.schemas.integrity import ReconcileRead, WageAuditRead, WageIssueRead
 from app.schemas.ledger import WorkerLedger
 from app.schemas.piece_rate import PieceRateLogRead
 from app.schemas.transaction import TransactionCreate, TransactionRead
-from app.schemas.user import UserRead, WorkerCreate, WorkerReplace, WorkerUpdate
+from app.schemas.user import (
+    UserRead,
+    WorkerCreate,
+    WorkerReplace,
+    WorkerSaved,
+    WorkerUpdate,
+)
 from app.services.cash import (
     build_series,
     build_summary,
     ensure_default_categories,
 )
 from app.routers.piece_rate import build_piece_rate_log, ensure_no_active_plan
-from app.services.deductions import active_plans, apply_installment, recompute_balance
-from app.services.wages import clear_attendance_wage, sync_attendance_wage
+from app.services.attendance import (
+    DayOutcome,
+    check_markable,
+    correct_day,
+    find_day,
+    record_day,
+    remove_day,
+    why_unmarkable,
+)
+from app.services.integrity import (
+    audit_wages,
+    count_by_kind,
+    price_unpriced_days,
+    reconcile_wages,
+)
+from app.services.wages import reprice_days
 from app.services.ledger import build_worker_ledger, calculate_balance
 from app.services.storage import public_url
 from app.services.notifications import notify_transaction, should_notify
@@ -174,6 +199,11 @@ def list_workers(
         default="worker",
         description="Which of the contractor's people to list. Admin only for supervisors.",
     ),
+    site_id: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="Only the crew posted to this site. 0 lists the workers posted nowhere.",
+    ),
 ) -> list[User]:
     """The crew this caller may see.
 
@@ -205,21 +235,56 @@ def list_workers(
     # nothing at all.
     if not include_inactive:
         stmt = stmt.where(User.is_active.is_(True))
+    if site_id == 0:
+        stmt = stmt.where(User.site_id.is_(None))
+    elif site_id is not None:
+        # Narrowing, never widening: a supervisor's statement is already
+        # limited to the sites they run, so naming another site finds nobody.
+        stmt = stmt.where(User.site_id == site_id)
 
     return list(db.scalars(stmt.order_by(User.name)).all())
 
 
-@router.patch("/workers/{worker_id}", response_model=UserRead)
+def _set_active(worker: User, active: bool, last_day: Optional[date_type] = None) -> None:
+    """Deactivate or reactivate, keeping `deactivated_on` in step with the flag.
+
+    Deactivating records the first day the worker no longer works here: the
+    day after `last_day`, which defaults to today - "remove from the crew"
+    said at the end of a shift does not unmark the shift. Deactivating someone
+    already inactive keeps the date they left. Reactivating clears it.
+    """
+    if active:
+        worker.is_active = True
+        worker.deactivated_on = None
+        return
+    if worker.is_active or worker.deactivated_on is None:
+        worker.is_active = False
+        worker.deactivated_on = (last_day or business_today()) + timedelta(days=1)
+
+
+def _saved(worker: User, days_priced: int = 0, days_repriced: int = 0) -> WorkerSaved:
+    read = WorkerSaved.model_validate(worker)
+    read.days_priced = days_priced
+    read.days_repriced = days_repriced
+    return read
+
+
+@router.patch("/workers/{worker_id}", response_model=WorkerSaved)
 def edit_worker(
     worker_id: int,
     payload: WorkerUpdate,
     contractor: CurrentContractor,
     db: DbSession,
-) -> User:
+) -> WorkerSaved:
     """Change a worker's details, chiefly which site they are posted to.
 
     Posting the crew to a site is what makes the site screens mean anything —
     the gallery, the crew list and the rain-out button all read `site_id`.
+
+    Setting a rate (or the pay basis) prices any day marked while the worker
+    had none - see `price_unpriced_days`. `days_priced` in the response says
+    how many, so the app can tell the contractor rather than leave a balance
+    to move unexplained.
     """
     worker = _get_own_worker(db, contractor, worker_id)
 
@@ -228,22 +293,32 @@ def edit_worker(
         # Sent explicitly, so None here means "take them off the site" rather
         # than "leave it alone".
         fields["site_id"] = _check_site(db, contractor, fields["site_id"])
+    active = fields.pop("is_active", None)
 
     for field, value in fields.items():
         setattr(worker, field, value)
+    if active is not None:
+        _set_active(worker, active)
+    db.flush()
+
+    priced = (
+        price_unpriced_days(db, worker)
+        if {"daily_wage", "wage_type"} & fields.keys()
+        else 0
+    )
 
     db.commit()
     db.refresh(worker)
-    return worker
+    return _saved(worker, days_priced=priced)
 
 
-@router.put("/workers/{worker_id}", response_model=UserRead)
+@router.put("/workers/{worker_id}", response_model=WorkerSaved)
 def replace_worker(
     worker_id: int,
     payload: WorkerReplace,
     contractor: CurrentContractor,
     db: DbSession,
-) -> User:
+) -> WorkerSaved:
     """Save the whole of a worker's edit form.
 
     The correction route. A name typed wrong on the morning somebody first
@@ -256,24 +331,53 @@ def replace_worker(
     the form can CLEAR a wage rather than just overwrite it. `PATCH` is still
     there for the app's one-field writes. See `WorkerReplace`.
 
-    Days already worked keep the rate they were worked at - changing the wage
-    is not a rewrite of the books. See app/services/wages.py.
+    DAYS ALREADY MARKED
+    -------------------
+    Keep the rate they were worked at - changing the wage is not a rewrite of
+    the books (see app/services/wages.py). Two exceptions, both reported back:
+
+      * days marked while the worker had NO rate are priced at the new one
+        (`days_priced`) - they were never priced at anything;
+      * `reprice_existing` moves every day-rated day (from `reprice_from`, or
+        all of them) onto the new rate (`days_repriced`) - the fix for "agreed
+        600, typed 60", which is otherwise stuck at 60 forever.
     """
     worker = _get_own_worker(db, contractor, worker_id)
+
+    if payload.reprice_existing and (
+        payload.wage_type is not WageType.DAILY
+        or payload.daily_wage is None
+        or payload.daily_wage <= 0
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Only a positive day rate can be applied to days already marked - "
+                "re-pricing onto no rate would take back wages that were earned"
+            ),
+        )
 
     worker.name = payload.name
     worker.daily_wage = payload.daily_wage
     worker.trade = payload.trade
     worker.wage_type = payload.wage_type
-    worker.is_active = payload.is_active
+    _set_active(worker, payload.is_active)
     # Validated rather than assigned straight through: a site belonging to
     # another contractor answers 404 like everything else here, and 0 is the
     # form's way of saying "not posted anywhere".
     worker.site_id = _check_site(db, contractor, payload.site_id)
+    db.flush()
+
+    priced = price_unpriced_days(db, worker)
+    repriced = (
+        reprice_days(db, worker, from_date=payload.reprice_from)
+        if payload.reprice_existing
+        else 0
+    )
 
     db.commit()
     db.refresh(worker)
-    return worker
+    return _saved(worker, days_priced=priced, days_repriced=repriced)
 
 
 @router.delete("/workers/{worker_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -286,6 +390,13 @@ def remove_worker(
         description=(
             "Delete the row outright. Refused once the worker has any history — "
             "use it only to undo a mistyped entry."
+        ),
+    ),
+    last_day: Optional[date_type] = Query(
+        default=None,
+        description=(
+            "The last day they worked. Defaults to today; days after it can no "
+            "longer be marked."
         ),
     ),
 ) -> Response:
@@ -303,8 +414,10 @@ def remove_worker(
     and only the first one is being made here.
 
     So the row stays, `is_active` goes false, and the worker drops out of the
-    crew list, the attendance grid and the payroll preview while their ledger
-    survives for the reports that already went out.
+    crew list and the attendance grid while their ledger survives for the
+    reports that already went out. Days up to `last_day` can still be marked
+    (a back-dated register, an offline phone catching up); days after it
+    cannot. See `User.deactivated_on`.
 
     `?purge=true` is the escape hatch for the real case a soft delete does not
     cover: a name typed wrong thirty seconds ago. It is refused the moment any
@@ -358,10 +471,12 @@ def remove_worker(
         db.commit()
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    worker.is_active = False
-    # Taken off the site as well, so the rain-out button and the site crew
-    # list stop counting someone who is no longer on the job.
-    worker.site_id = None
+    _set_active(worker, False, last_day)
+    # The site posting is KEPT. The crew list, the rain-out and the attendance
+    # grid all filter on `is_active` already, so nothing counts them; keeping
+    # the post means the site's reports can still say who was on the job, a
+    # supervisor can still correct a day they worked there, and reactivating
+    # puts them back where they were.
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -374,88 +489,49 @@ def log_attendance(
 ) -> Attendance:
     """Record one day's attendance for a worker.
 
-    A day that earns a wage writes it here - see app/services/wages.py.
+    This is also the route the app's offline queue replays, so its contract is
+    load-bearing: a day already marked answers 409, which the queue reads as
+    "recorded" and drops; anything that cannot be marked answers 422, which the
+    queue surfaces to the contractor instead of losing.
+
+    The day, its wage and its installment are written together - see
+    app/services/attendance.py. The row is stamped with the site it was worked
+    at: the one named, or wherever the worker is posted.
     """
     worker = _get_own_worker(db, contractor, payload.worker_id)
-
-    attendance = Attendance(
-        worker_id=payload.worker_id,
-        date=payload.date,
-        status=payload.status,
-        shift=payload.shift,
-        note=payload.note,
+    site_id = (
+        _check_site(db, contractor, payload.site_id)
+        if payload.site_id
+        else worker.site_id
     )
-    db.add(attendance)
-    try:
-        # Flushed rather than committed, so the wage below joins this row in
-        # one transaction: a day and the money it earned land together.
-        db.flush()
-    except IntegrityError:
-        # One attendance row per worker per day (uq_attendance_worker_date).
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Attendance for this worker on this date has already been logged",
-        ) from None
 
-    sync_attendance_wage(db, attendance, worker)
+    already = HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Attendance for this worker on this date has already been logged",
+    )
+    if find_day(db, worker.id, payload.date) is not None:
+        raise already
+
+    try:
+        attendance, _, _ = record_day(
+            db,
+            worker,
+            payload.date,
+            payload.status,
+            shift=payload.shift,
+            note=payload.note,
+            site_id=site_id,
+            existing=None,
+        )
+    except IntegrityError:
+        # Marked by another request between the check above and the insert
+        # (uq_attendance_worker_date). Same answer as if it had been first.
+        db.rollback()
+        raise already from None
 
     db.commit()
     db.refresh(attendance)
     return attendance
-
-
-def _resettle_installment(
-    db: Session,
-    worker_id: int,
-    old_date: date_type,
-    old_status: AttendanceStatus,
-    new_date: date_type,
-    new_status: AttendanceStatus,
-) -> None:
-    """Move a day's installment to match a corrected attendance row.
-
-    A day marked present under an active plan takes that day's deduction.
-    Correcting the day to absent has to give it back, or the worker quietly
-    pays an installment for a day they did not work — which is the exact thing
-    `EARNING_STATUSES` exists to prevent, and an edit must not be a way around
-    it.
-
-    Done by deleting the old day's row and re-applying against the new one,
-    rather than by arithmetic on `balance_remaining`: that column is a rollup
-    and `recompute_balance` is the only thing allowed to move it (see
-    app/services/deductions.py).
-
-    ONE THING IT DELIBERATELY DOES NOT DO
-    -------------------------------------
-    A plan closed by its final installment stays closed when that installment
-    is reversed, leaving a small balance on an inactive plan. `is_active=False`
-    means both "paid off" and "written off by hand" and the row cannot tell
-    them apart, so reopening one the contractor deliberately closed is the
-    worse mistake. The deductions screen shows the balance and can reopen it.
-    """
-    if (old_date, old_status) == (new_date, new_status):
-        return
-
-    # Found through the installment itself rather than through `active_plans`,
-    # so a day can still be given back after its plan has closed.
-    stale = db.scalar(
-        select(DeductionInstallment).where(
-            DeductionInstallment.worker_id == worker_id,
-            DeductionInstallment.date == old_date,
-        )
-    )
-    if stale is not None:
-        plan = db.get(AutoDeduction, stale.deduction_id)
-        db.delete(stale)
-        # So the sum below does not still see the row being removed.
-        db.flush()
-        if plan is not None:
-            recompute_balance(db, plan)
-
-    plan = active_plans(db, [worker_id]).get(worker_id)
-    if plan is not None:
-        apply_installment(db, plan, new_date, new_status)
 
 
 @router.patch("/attendance/{attendance_id}", response_model=AttendanceRead)
@@ -477,12 +553,14 @@ def edit_attendance(
     the ones who find it wrong; `require_site_worker` narrows them to the crew
     posted to a site they actually run.
 
-    Changing the status re-settles that day's installment — see
-    `_resettle_installment`. Piece-rate wages are untouched: they are paid on
-    quantity x rate, not on a status, so correcting who was present does not
-    change what was measured.
+    The wage and the day's installment follow the correction - see
+    `correct_day`. Piece-rate wages are untouched: they are paid on quantity x
+    rate, not on a status, so correcting who was present does not change what
+    was measured.
     """
-    attendance = db.get(Attendance, attendance_id)
+    # Locked: the wage and the installment are about to be rewritten from
+    # what this row says, and a second correction racing this one must wait.
+    attendance = db.get(Attendance, attendance_id, with_for_update=True)
     if attendance is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Attendance record not found"
@@ -494,26 +572,8 @@ def edit_attendance(
     if not fields:
         return attendance
 
-    old_date = attendance.date
-    old_status = attendance.status
-
-    new_date = fields.get("date", old_date)
-    if new_date > date_type.today():
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="A day cannot be marked before it happens",
-        )
-
-    for field, value in fields.items():
-        setattr(attendance, field, value)
-
     try:
-        # Flushed before the installment work rather than left to the commit
-        # below. `apply_installment` runs its insert inside a SAVEPOINT and
-        # swallows IntegrityError as "this day is already deducted" — a clash
-        # on uq_attendance_worker_date surfacing in there would be caught by
-        # the wrong handler and roll this edit back without saying so.
-        db.flush()
+        correct_day(db, attendance, worker, fields)
     except IntegrityError:
         # The day it was moved onto is already marked. Merging the two rows is
         # not this endpoint's call to make.
@@ -522,13 +582,6 @@ def edit_attendance(
             status_code=status.HTTP_409_CONFLICT,
             detail="This worker is already marked for that date",
         ) from None
-
-    _resettle_installment(
-        db, worker.id, old_date, old_status, attendance.date, attendance.status
-    )
-    # The day's wage follows the day: corrected to absent it is taken back,
-    # to a half day it is halved, and moved to another date it moves with it.
-    sync_attendance_wage(db, attendance, worker)
 
     db.commit()
     db.refresh(attendance)
@@ -552,31 +605,11 @@ def remove_attendance(
     because absent is a statement about somebody who was expected; it keeps the
     worker on the roster for a day they were never on.
 
-    So this removes the row. Like `remove_transaction` and unlike
-    `remove_worker`, there is no deactivate-instead split to make: either the
-    day happened or the tap was a mistake, and a mistake has no history worth
-    keeping.
-
-    WHAT IT GIVES BACK
-    ------------------
-    A day marked present under an active plan took that day's deduction. The
-    row going away has to hand it back, or the worker keeps paying an
-    installment for a day that is no longer on the books. Done through
-    `_resettle_installment` with the same day as both the old and the new date
-    and `ABSENT` as the new status, which is exactly "delete this day's
-    installment and apply nothing in its place" - the one path that moves
-    `balance_remaining` through `recompute_balance` rather than by arithmetic.
-
-    WHAT IT REFUSES
-    ---------------
-    A day that paid piece-rate wages is not an empty mark. The log wrote a WAGE
-    `Transaction` in the same DB transaction, so deleting the attendance would
-    leave money paid for a day the worker is no longer recorded as having
-    worked. Refused with a 409 naming the log, matching `remove_transaction`:
-    the caller is told what to unwind first rather than left with a ledger that
-    does not add up.
+    So this removes the row, and with it the wage the day earned and the
+    installment it took - see `remove_day`, which also refuses a day that paid
+    piece-rate wages (409, naming the log to remove first).
     """
-    attendance = db.get(Attendance, attendance_id)
+    attendance = db.get(Attendance, attendance_id, with_for_update=True)
     if attendance is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Attendance record not found"
@@ -585,36 +618,7 @@ def remove_attendance(
     # to another contractor's crew - a 403 would confirm it exists.
     worker = require_site_worker(db, staff, attendance.worker_id)
 
-    if db.scalar(
-        select(PieceRateLog.id)
-        .where(
-            PieceRateLog.worker_id == attendance.worker_id,
-            PieceRateLog.date == attendance.date,
-        )
-        .limit(1)
-    ) is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "This day paid piece-rate wages - delete the piece-rate log first"
-            ),
-        )
-
-    day = attendance.date
-    old_status = attendance.status
-
-    # Before the delete, while the link is still readable.
-    clear_attendance_wage(db, attendance)
-
-    db.delete(attendance)
-    # Flushed before the installment work for the same reason the edit is:
-    # `apply_installment` runs inside a SAVEPOINT, and anything surfacing from
-    # this delete in there would be caught by the wrong handler.
-    db.flush()
-
-    _resettle_installment(
-        db, worker.id, day, old_status, day, AttendanceStatus.ABSENT
-    )
+    remove_day(db, attendance, worker)
 
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -634,8 +638,29 @@ def log_transaction(
     A settled payment or a large advance also sends the worker a message. That
     runs as a background task after the response, so a messaging outage cannot
     turn a successful ledger write into a failed request.
+
+    SAFE TO RETRY WITH A client_ref
+    -------------------------------
+    The app's offline queue sends one. When a row already carries it, that
+    row is returned and nothing is written - so a queued advance whose first
+    attempt committed but whose response was lost cannot pay the worker
+    twice. Same contract as `POST /contractor/cash-entries`.
     """
     worker = _get_own_worker(db, contractor, payload.worker_id)
+
+    if payload.client_ref:
+        replay = _transaction_by_ref(db, contractor, payload.client_ref)
+        if replay is not None:
+            return _read_transaction(replay)
+
+    if payload.date > business_today():
+        # Money that has not moved yet is not a ledger entry. An advance typed
+        # with tomorrow's date sits in the lifetime balance today while every
+        # payroll window ending today leaves it out, so the two disagree.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A ledger entry cannot be dated in the future",
+        )
 
     if payload.payment_mode is not None and payload.type is TransactionType.WAGE:
         # A wage is an amount earned, not an amount handed over. Letting one
@@ -659,6 +684,14 @@ def log_transaction(
         payment_mode=payload.payment_mode,
         note=payload.note,
         audio_note_path=attach_audio_note(payload.audio_note_path, contractor),
+        client_ref=payload.client_ref,
+        # The site named, or where the worker is posted now. Validated: a site
+        # belonging to someone else answers 404 like everywhere else.
+        site_id=(
+            _check_site(db, contractor, payload.site_id)
+            if payload.site_id
+            else worker.site_id
+        ),
     )
     db.add(transaction)
 
@@ -678,7 +711,27 @@ def log_transaction(
         )
         db.add(deduction)
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two replays of one queued entry racing each other through the
+        # UNIQUE client_ref. The row that won is the one to return.
+        db.rollback()
+        replay = (
+            _transaction_by_ref(db, contractor, payload.client_ref)
+            if payload.client_ref
+            else None
+        )
+        if replay is not None:
+            return _read_transaction(replay)
+        if payload.client_ref:
+            # The key is held by a row this contractor cannot see. Refused
+            # without saying whose - and never by returning that row.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This entry's reference is already in use. Save it again.",
+            ) from None
+        raise
     db.refresh(transaction)
     if deduction is not None:
         db.refresh(deduction)
@@ -690,6 +743,21 @@ def log_transaction(
         background.add_task(notify_transaction, transaction, worker, contractor, balance)
 
     return _read_transaction(transaction, deduction)
+
+
+def _transaction_by_ref(
+    db: Session, contractor: User, client_ref: str
+) -> Optional[Transaction]:
+    """The row a client_ref already wrote, if it was this contractor's.
+
+    Scoped through the worker so one contractor's key can never return
+    another's row - the key space is shared, the books are not.
+    """
+    return db.scalar(
+        select(Transaction)
+        .join(User, User.id == Transaction.worker_id)
+        .where(Transaction.client_ref == client_ref, User.contractor_id == contractor.id)
+    )
 
 
 @router.delete("/transactions/{transaction_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -771,6 +839,51 @@ def read_worker_ledger(
     return build_worker_ledger(db, worker, start_date, end_date)
 
 
+# --- does the ledger match the register? ------------------------------------
+
+
+@router.get("/integrity/wages", response_model=WageAuditRead)
+def read_wage_audit(contractor: CurrentContractor, db: DbSession) -> WageAuditRead:
+    """Check every day this crew has marked against the wage it earned.
+
+    Read-only. An empty `issues` list is the proof that every balance on every
+    screen is built from wages that match attendance exactly. See
+    app/services/integrity.py.
+    """
+    issues = audit_wages(db, contractor.id)
+    return WageAuditRead(
+        consistent=all(issue.kind == "unpriced" for issue in issues),
+        counts=count_by_kind(issues),
+        issues=[WageIssueRead(**asdict(issue)) for issue in issues],
+    )
+
+
+@router.post("/integrity/wages/reconcile", response_model=ReconcileRead)
+def run_wage_reconcile(
+    contractor: CurrentContractor,
+    db: DbSession,
+    apply: bool = Query(
+        default=False,
+        description=(
+            "False (the default) reports what would change and writes nothing. "
+            "True makes the change."
+        ),
+    ),
+) -> ReconcileRead:
+    """Bring every day's wage in line with the day - after showing what moves.
+
+    Prices days that earn but have no rate at the worker's current rate,
+    writes the wages they are missing, and links a wage typed by hand for the
+    same worker, day and amount instead of doubling it. Run it without `apply`
+    first: the report is the decision, and it says per worker how much their
+    balance would move.
+    """
+    report = reconcile_wages(db, contractor.id, apply=apply)
+    if apply:
+        db.commit()
+    return ReconcileRead(**report.as_dict())
+
+
 # --- the whole crew, one request --------------------------------------------
 
 
@@ -788,7 +901,7 @@ def log_bulk_attendance(
     Three things happen per row, and they happen together because they are one
     act on site — the contractor walking the line at the end of the shift:
 
-      1. the attendance row is written
+      1. the attendance row is written, with the wage it earns
       2. a piece-rate row (quantity x rate) also writes its WAGE transaction
       3. an active installment plan takes that day's deduction
 
@@ -804,15 +917,67 @@ def log_bulk_attendance(
     one for that date, and installments are guarded by a unique constraint on
     (plan, day). Submitting the same grid twice therefore changes nothing the
     second time, rather than paying the crew twice.
+
+    Two phones submitting the same crew at the same moment both pass the
+    "already marked" check, and the second insert then trips
+    uq_attendance_worker_date. That request is rolled back and run once more,
+    when it finds the first one's rows and leaves them alone - the same answer
+    it would have got a second later.
     """
-    when = payload.date or date_type.today()
-    if when > date_type.today():
+    when = payload.date or business_today()
+    if when > business_today():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A day cannot be marked before it happens",
         )
 
     site_id = _check_staff_site(db, staff, payload.site_id)
+
+    try:
+        result = _mark_crew(db, staff, payload, when, site_id)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        result = _mark_crew(db, staff, payload, when, site_id)
+        db.commit()
+
+    rows, logs, installments, counts = result
+    for row in rows:
+        db.refresh(row)
+    for log in logs:
+        db.refresh(log)
+
+    return BulkAttendanceResult(
+        date=when,
+        site_id=site_id,
+        created=counts[DayOutcome.CREATED],
+        updated=counts[DayOutcome.UPDATED],
+        unchanged=counts[DayOutcome.UNCHANGED],
+        attendance=[AttendanceRead.model_validate(row) for row in rows],
+        piece_rate_logs=[PieceRateLogRead.model_validate(log) for log in logs],
+        piece_rate_total=sum((log.total_amount for log in logs), Decimal("0.00")),
+        installments=[
+            DeductionInstallmentRead.model_validate(row) for row in installments
+        ],
+        deductions_applied=sum(
+            (row.amount for row in installments), Decimal("0.00")
+        ),
+    )
+
+
+def _mark_crew(
+    db: Session,
+    staff: User,
+    payload: BulkAttendanceRequest,
+    when: date_type,
+    site_id: Optional[int],
+) -> tuple[
+    list[Attendance],
+    list[PieceRateLog],
+    list[DeductionInstallment],
+    dict[DayOutcome, int],
+]:
+    """The body of `log_bulk_attendance`, separated so a race can re-run it."""
     worker_ids = [mark.worker_id for mark in payload.marks]
 
     # An admin may mark anyone on their books, with or without a site. A
@@ -845,11 +1010,26 @@ def log_bulk_attendance(
     existing = {
         row.worker_id: row
         for row in db.scalars(
-            select(Attendance).where(
-                Attendance.worker_id.in_(worker_ids), Attendance.date == when
-            )
+            select(Attendance)
+            .where(Attendance.worker_id.in_(worker_ids), Attendance.date == when)
+            .with_for_update()
         ).all()
     }
+
+    # Refused up front, all at once, before anything is written: a worker who
+    # has been taken off the crew is not marked for a day after they left. A
+    # row that already exists is not a new mark and is not refused.
+    refused = [
+        reason
+        for worker_id in worker_ids
+        if worker_id not in existing
+        and (reason := why_unmarkable(crew[worker_id], when)) is not None
+    ]
+    if refused:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=" ".join(refused)
+        )
+
     # Workers who already have piece work logged for this day; their rows are
     # skipped so a retried submission cannot pay for the same tiles twice.
     already_logged = set(
@@ -860,44 +1040,16 @@ def log_bulk_attendance(
         ).all()
     )
 
-    plans = active_plans(db, worker_ids)
-
-    created = updated = unchanged = 0
+    counts = {outcome: 0 for outcome in DayOutcome}
     rows: list[Attendance] = []
     logs: list[PieceRateLog] = []
     installments: list[DeductionInstallment] = []
 
     for mark in payload.marks:
         worker = crew[mark.worker_id]
-        # A piece-rate worker who laid 120 sq ft was evidently there, so their
-        # row defaults to present rather than demanding a second tap.
-        wanted = mark.status or AttendanceStatus.PRESENT
-
-        row = existing.get(worker.id)
-        if row is None:
-            row = Attendance(
-                worker_id=worker.id,
-                date=when,
-                site_id=site_id or worker.site_id,
-                status=wanted,
-                shift=mark.shift,
-                note=mark.note,
-            )
-            db.add(row)
-            created += 1
-        elif payload.overwrite and (row.status is not wanted or row.shift is not mark.shift):
-            row.status = wanted
-            row.shift = mark.shift
-            if row.site_id is None:
-                row.site_id = site_id or worker.site_id
-            if mark.note:
-                row.note = mark.note
-            updated += 1
-        else:
-            unchanged += 1
-        rows.append(row)
 
         if mark.is_piece_rate and worker.id not in already_logged:
+            check_markable(worker, when)
             log, transaction = build_piece_rate_log(
                 worker,
                 mark.work_description or "Piece work",
@@ -909,52 +1061,32 @@ def log_bulk_attendance(
             )
             db.add(transaction)
             # The log has to point at the wage it earned, so the id is needed
-            # before the commit below.
+            # before the commit.
             db.flush()
             log.transaction_id = transaction.id
             db.add(log)
             logs.append(log)
 
-        # The day's wage, for a worker on a day rate. Called for an unchanged
-        # row too: `sync_attendance_wage` is idempotent, so a resubmitted grid
-        # settles on the same single wage rather than paying twice. Piece-rate
-        # rows are skipped inside it - their log above already paid them.
-        db.flush()
-        sync_attendance_wage(db, row, worker)
+        # A piece-rate worker who laid 120 sq ft was evidently there, so their
+        # row defaults to present rather than demanding a second tap. Their
+        # day earns no day rate - the log above paid them (see wages.py).
+        row, outcome, installment = record_day(
+            db,
+            worker,
+            when,
+            mark.status or AttendanceStatus.PRESENT,
+            shift=mark.shift,
+            note=mark.note,
+            site_id=site_id or worker.site_id,
+            overwrite=payload.overwrite,
+            existing=existing.get(worker.id),
+        )
+        counts[outcome] += 1
+        rows.append(row)
+        if installment is not None:
+            installments.append(installment)
 
-        plan = plans.get(worker.id)
-        if plan is not None:
-            # Safe to call for an unchanged row too: the unique constraint on
-            # (plan, day) turns a repeat into a no-op rather than a second
-            # deduction. `row.status` rather than `wanted`, so a row left
-            # alone deducts against what it actually says.
-            installment = apply_installment(db, plan, when, row.status)
-            if installment is not None:
-                installments.append(installment)
-
-    db.commit()
-
-    for row in rows:
-        db.refresh(row)
-    for log in logs:
-        db.refresh(log)
-
-    return BulkAttendanceResult(
-        date=when,
-        site_id=site_id,
-        created=created,
-        updated=updated,
-        unchanged=unchanged,
-        attendance=[AttendanceRead.model_validate(row) for row in rows],
-        piece_rate_logs=[PieceRateLogRead.model_validate(log) for log in logs],
-        piece_rate_total=sum((log.total_amount for log in logs), Decimal("0.00")),
-        installments=[
-            DeductionInstallmentRead.model_validate(row) for row in installments
-        ],
-        deductions_applied=sum(
-            (row.amount for row in installments), Decimal("0.00")
-        ),
-    )
+    return rows, logs, installments, counts
 
 
 # --- QR check-in ------------------------------------------------------------
@@ -973,37 +1105,28 @@ def scan_attendance(
 
     Overwrites a status already recorded for the day, which is the useful
     behaviour: the worker is standing in front of the contractor, so the scan
-    is the better evidence.
+    is the better evidence. The wage and the installment follow the scan
+    exactly as they follow a correction.
+
+    A deactivated worker's badge is refused even when the day already has a
+    row - the scan is a claim that they are here today.
     """
     worker = _get_own_worker(db, contractor, payload.worker_id)
-    day = payload.date or date_type.today()
+    day = payload.date or business_today()
+    check_markable(worker, day)
 
-    attendance = db.scalar(
-        select(Attendance).where(
-            Attendance.worker_id == worker.id, Attendance.date == day
-        )
-    )
-    if attendance is None:
-        attendance = Attendance(
-            worker_id=worker.id,
-            date=day,
+    try:
+        attendance, _, _ = record_day(
+            db,
+            worker,
+            day,
+            payload.status,
+            shift=payload.shift,
             # Where the worker is posted today. Copied onto the row so moving
             # them tomorrow does not rewrite where they were seen.
             site_id=worker.site_id,
-            status=payload.status,
-            shift=payload.shift,
+            overwrite=True,
         )
-        db.add(attendance)
-    else:
-        attendance.status = payload.status
-        attendance.shift = payload.shift
-        if attendance.site_id is None:
-            attendance.site_id = worker.site_id
-
-    try:
-        # Flushed first so the wage joins the scan in one transaction.
-        db.flush()
-        sync_attendance_wage(db, attendance, worker)
         db.commit()
     except IntegrityError:
         # Two scans of the same badge racing each other. The row that won is
@@ -1108,10 +1231,12 @@ def decide_advance_request(
             worker_id=worker.id,
             type=TransactionType.ADVANCE,
             amount=amount,
-            date=date_type.today(),
+            date=business_today(),
             # How the contractor actually handed it over. Defaults to cash,
             # which is what happens on site when nobody says otherwise.
             payment_mode=payload.payment_mode or PaymentMode.CASH,
+            # Handed over where the worker is posted.
+            site_id=worker.site_id,
             # The note survives in the ledger even if the request row is ever
             # pruned, so the entry stays explicable on its own.
             note=payload.note or f"Advance request #{request.id}",
@@ -1324,9 +1449,10 @@ def list_cash_entries(
     start_date: Optional[date_type] = Query(default=None),
     end_date: Optional[date_type] = Query(default=None),
     direction: Optional[CashDirection] = Query(default=None),
+    site_id: Optional[int] = Query(default=None, gt=0),
     limit: int = Query(default=200, ge=1, le=1000),
 ) -> list[CashEntryRead]:
-    """Recent cash entries, newest first."""
+    """Recent cash entries, newest first - for the business, or one site."""
     stmt = (
         select(CashEntry)
         .options(joinedload(CashEntry.category))
@@ -1338,6 +1464,8 @@ def list_cash_entries(
         stmt = stmt.where(CashEntry.date <= end_date)
     if direction is not None:
         stmt = stmt.where(CashEntry.direction == direction)
+    if site_id is not None:
+        stmt = stmt.where(CashEntry.site_id == _check_site(db, contractor, site_id))
 
     entries = db.scalars(
         stmt.order_by(CashEntry.date.desc(), CashEntry.id.desc()).limit(limit)
@@ -1388,7 +1516,10 @@ def add_cash_entry(
     entry = CashEntry(
         contractor_id=contractor.id,
         category_id=category.id if category else None,
-        site_id=payload.site_id,
+        # Checked, not trusted: the column is a bare FK, so without this an
+        # entry could be filed against another contractor's site id and turn
+        # up in their site's spending.
+        site_id=_check_site(db, contractor, payload.site_id),
         direction=direction,
         amount=payload.amount,
         date=payload.date,
@@ -1428,6 +1559,8 @@ def edit_cash_entry(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entry not found")
 
     fields = payload.model_dump(exclude_unset=True)
+    if "site_id" in fields:
+        fields["site_id"] = _check_site(db, contractor, fields["site_id"])
     if fields.get("category_id") is not None:
         category = _get_own_category(db, contractor, fields["category_id"])
         # Moving an entry between buckets moves it between sides of the chart
@@ -1461,13 +1594,17 @@ def read_summary(
     db: DbSession,
     start_date: Optional[date_type] = Query(default=None),
     end_date: Optional[date_type] = Query(default=None),
+    site_id: Optional[int] = Query(default=None, gt=0),
 ) -> CashSummary:
     """Cash in, cash out, and the balance between them.
 
     Unbounded by default, which is what the Home screen wants: the balance of
-    the whole job, not of an arbitrary window.
+    the whole job, not of an arbitrary window. `site_id` narrows every figure
+    to one site - see `build_summary`.
     """
-    return build_summary(db, contractor.id, start_date, end_date)
+    if site_id is not None:
+        _check_site(db, contractor, site_id)
+    return build_summary(db, contractor.id, start_date, end_date, site_id)
 
 
 @router.get("/analytics", response_model=AnalyticsSeries)
@@ -1477,6 +1614,9 @@ def read_analytics(
     period: Literal["day", "week", "month"] = Query(default="week"),
     start_date: Optional[date_type] = Query(default=None),
     end_date: Optional[date_type] = Query(default=None),
+    site_id: Optional[int] = Query(default=None, gt=0),
 ) -> AnalyticsSeries:
     """Bars for the analytics chart: money out against money in, over time."""
-    return build_series(db, contractor.id, period, start_date, end_date)
+    if site_id is not None:
+        _check_site(db, contractor, site_id)
+    return build_series(db, contractor.id, period, start_date, end_date, site_id)

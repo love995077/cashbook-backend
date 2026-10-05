@@ -29,3 +29,14 @@ mobile/
 # Throwaway SQLite database created by scripts/dev_server_sqlite.py for
 # driving the app in a browser. Recreated on every start.
 dev_browser_test.sqlite3
+
+# Test-run artefacts.
+.hypothesis/
+
+# Database dumps (scripts/backup_postgres.sh) and deploy tarballs. Never commit
+# client data.
+backups/
+*.tgz
+
+# Local note pointing at the last APK build.
+MONEYMATE_APK_URL.txt

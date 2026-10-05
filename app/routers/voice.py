@@ -20,6 +20,7 @@ from decimal import Decimal
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import select
 
+from app.core.clock import business_today
 from app.dependencies import CurrentContractor, DbSession
 from app.models.enums import UserRole
 from app.models.transaction import Transaction
@@ -146,7 +147,7 @@ async def voice_entry(
         )
 
     # --- 4. transcript to intent [PLACEHOLDER] ----------------------------
-    today = date_type.today()
+    today = business_today()
     try:
         intent = await parse_intent(
             transcript=transcript,

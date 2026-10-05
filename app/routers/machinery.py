@@ -37,6 +37,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.clock import business_today
 from app.config import get_settings
 from app.dependencies import CurrentSiteStaff, DbSession, require_site_access
 from app.models.machinery import MachineryLog
@@ -120,7 +121,7 @@ def read_machinery_totals(
     with three hundred logs would otherwise total only the hundred it drew.
     """
     require_site_access(db, staff, site_id)
-    until = end_date or date_type.today()
+    until = end_date or business_today()
 
     filters = [MachineryLog.site_id == site_id, MachineryLog.date <= until]
     if start_date is not None:
@@ -209,8 +210,8 @@ async def add_machinery_log(
             ],
         ) from exc
 
-    when = payload.date or date_type.today()
-    if when > date_type.today():
+    when = payload.date or business_today()
+    if when > business_today():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A machine cannot be logged before the day it ran",
@@ -287,7 +288,7 @@ def edit_machinery_log(
     log = _get_log(db, site_id, log_id)
 
     fields = payload.model_dump(exclude_unset=True)
-    if fields.get("date") and fields["date"] > date_type.today():
+    if fields.get("date") and fields["date"] > business_today():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A machine cannot be logged before the day it ran",

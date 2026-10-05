@@ -6,12 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Two halves in one tree, and most tasks touch both:
 
-- `/` — FastAPI + SQLAlchemy 2.0 + MySQL backend. **Not a git repository.**
-- `mobile/` — Expo (SDK 57) + Expo Router client. **This is the git repo** (`master`).
+- `/` — FastAPI + SQLAlchemy 2.0 + **PostgreSQL** backend. Git repo `love995077/cashbook-backend`, branch `main`.
+- `mobile/` — Expo (SDK 57) + Expo Router client. Its **own** git repo `love995077/cashbook-mobile`, branch `master` (ignored by the backend repo).
+
+Commits carry no `Co-authored-by` trailer - attribute to the local git user only.
 
 A feature is normally not done until the model, the schema, the router, `mobile/src/data/types.ts`, `mobile/src/api/endpoints.ts`, `mobile/src/data/store.tsx` and a screen all agree. Adding a screen without the route it calls, or a route without the mobile mapper, leaves a dead end.
 
-`README.md` (backend) and `mobile/README.md` document the endpoint tables and the file layout in detail; `phase.md` holds the original phase-by-phase brief. Prefer reading those over re-deriving.
+`README.md` (backend) and `mobile/README.md` document the endpoint tables and the file layout in detail; `phase.md` holds the original phase-by-phase brief; `DEPLOYMENT.md` is how production runs. Prefer reading those over re-deriving.
 
 ## Commands
 
@@ -19,7 +21,8 @@ Backend, from `/`:
 
 ```bash
 .venv/Scripts/python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
-python scripts/smoke_phase5.py          # end-to-end check, in-memory SQLite
+.venv/Scripts/python.exe -m pytest                       # SQLite, ~4 min with the property test
+TEST_DATABASE_URL=postgresql+psycopg://... pytest        # the real engine - do this before shipping
 alembic revision --autogenerate -m "..."
 alembic upgrade head
 ```
@@ -38,12 +41,28 @@ npx tsc --noEmit        # there is no `typecheck` script; run it directly
 
 ## Verification
 
-There is no pytest suite and no jest. The convention is a **standalone smoke script** driving `TestClient` against a throwaway SQLite database — see `scripts/smoke_phase5.py` for the pattern. New backend surface should get one, or extend an existing one.
+**pytest** (`tests/`, deps in `requirements-dev.txt`). `tests/conftest.py` overrides `DATABASE_URL` before importing the app and builds its own engine, so the configured database is never touched. SQLite by default; set `TEST_DATABASE_URL` to run against PostgreSQL (schema built by the real Alembic chain) or MySQL. Run against PostgreSQL before shipping anything that touches money - SQLite stores DECIMAL through a float and takes no row locks.
 
-Two traps when writing them:
+- Write through the HTTP API (`tests/helpers.py`), assert by reading the DB. `api.fresh()` ends the assertion session's transaction - required on MySQL (REPEATABLE READ), harmless elsewhere.
+- Compute expected money **independently** (`expected_day_wage` in helpers), never with the code under test.
+- `api.assert_ledger_matches_register(...)` checks the wage invariant two ways; call it after anything that changes a day.
+- `tests/test_property_ledger.py` (Hypothesis) runs random edit sequences against a model. When you change wage/attendance rules, update the model, and mutation-check it: reintroduce a bug and confirm it fails.
+- `tests/test_migrations.py` asserts `alembic check` is clean and the chain round-trips on PostgreSQL and MySQL.
 
-- Build your **own** engine (`create_engine("sqlite://", ...)`) and override `get_db` via `app.dependency_overrides`. Do not import `app.database.engine`: `Settings.connect_args` injects PyMySQL's `ssl` dict whenever a `DATABASE_URL` is set, and `sqlite3.connect()` rejects it.
-- `.env` points at a **live Aiven MySQL**. Never smoke-test against the configured database.
+The older `scripts/smoke_*.py` still run and still pass. `scripts/smoke_deployed.py <url>` checks a live deployment over HTTP (it writes a throwaway account).
+
+## Wages are derived from attendance - the invariant
+
+Every attendance row's linked WAGE (`attendance.transaction_id`) is exactly `round_half_up(wage_rate × weight(status))` on the row's date and site; a day that earns nothing has none. `weight`: present 1, half_day 0.5, absent/rain_out 0 (`STATUS_WEIGHT` in `app/services/wages.py` - one table, shared by wages, installments, reports).
+
+- **The rate is frozen on the day** (`attendance.wage_rate`): NULL = no rate known yet (priced when one is set, `price_unpriced_days`), 0 = piece-rate day (never priced), >0 = the rate. Syncing reads the row, never `users.daily_wage` - so a raise never reprices history. Only `reprice_existing` (PUT worker) moves old days deliberately.
+- **Every write to a day goes through `app/services/attendance.py`** (`record_day`, `correct_day`, `remove_day`), which moves the row, its wage and its installment together. Do not write `Attendance` rows anywhere else.
+- `app/services/integrity.py` audits the invariant (`GET /contractor/integrity/wages`) and reconciles it (dry-run by default; adopts a hand-typed wage for the same day+amount instead of doubling it).
+- "Today" is `business_today()` (`app/core/clock.py`, `BUSINESS_TIMEZONE`, default Asia/Kolkata). Never `date.today()` - containers run UTC.
+
+## Site-first
+
+Every money row says which site it belongs to: `transactions.site_id` (a day's wage = its attendance site, piece work = the log's site, anything else = the site named or the worker's posting at the time), `cash_entries.site_id`, `petty_cash.site_id`. Site figures and reports filter by **the site on the row**, never by `users.site_id` - so a moved or deactivated worker's history stays on the site where it happened. "Still owed" and crew counts are the opposite: who is posted there now. Deactivation keeps `users.site_id` and records `deactivated_on` (first day not worked); days before it can still be marked, days from it cannot (422, not 409 - the offline queue drops a 409 as "already recorded").
 
 ## Money, and how it crosses the wire
 
@@ -72,10 +91,13 @@ The store's `load()` in `mobile/src/data/store.tsx` branches on role. A supervis
 - **Uploads store a key, never a URL.** `app/services/storage.py` owns the allow-list and the key layout; `public_url()` derives the link at read time, so moving to a CDN changes one function. Write the file to storage **before** inserting the row, and delete it on the error path — an orphaned file is recoverable, a row pointing at a missing image is not.
 - **Multipart routes validate through the Pydantic schema by hand.** FastAPI is not validating a `Form()` route, so construct the schema in a `try` and re-raise `ValidationError` as a 422 (see `app/routers/machinery.py`) — otherwise it surfaces as a 500.
 - **Register new routers after `sites`** in `main.py`; they are parameterised children of `/contractor/sites` and the static path must match first. Declare static paths (`/preview`) before `/{id}` within a router for the same reason.
-- Alembic reads its URL from `app.config.Settings`, so migrations cannot run against a different database than the app.
+- Alembic reads its URL from `app.config.Settings`, so migrations cannot run against a different database than the app (override only via `ALEMBIC_DATABASE_URL`).
+- **Migrations must build PostgreSQL and MySQL.** Enum types: `ensure_enum` + `enum_type` from `app/core/migration_support.py` (an `op.add_column` never creates a PostgreSQL type); boolean defaults `sa.false()`, not `'0'`. Downgrades drop tables without dropping their indexes first (MySQL refuses FK-backed index drops). `alembic check` must stay clean on both.
+- Name lookups are case-insensitive where MySQL's collation made them so (stock items); PostgreSQL enforces it with `lower(name)` unique indexes owned by migration `3b7d9e2a4c61` and excluded from autogenerate (`_ci` suffix).
 
 ## Mobile conventions
 
+- **Site-first layout.** An admin's Home is the site list (`SiteCard`, fed by `GET /contractor/sites/overview` held in the store). A site (`site/[id]`) holds that site's Labour, Expenses and Reports tabs; the attendance grid takes `?siteId=`. The business-wide cash box lives on Analytics. The Workers tab is the crew directory (site filter, deactivated workers).
 - **`app/` is routing only.** Anything with real logic lives in `src/components/` and is rendered by the route file.
 - **Per-screen data is fetched per screen**, not held in the store: petty cash, stock, machinery, invoices and photo feeds all fetch on mount with an `AbortController`. The store holds only what the dashboard reads on every open (workers, sites, cash box, outstanding tools).
 - **Typed routes are generated.** After adding a file under `app/`, `.expo/types/router.d.ts` is stale until `npx expo start` regenerates it, and `tsc` will reject the new `router.push` path until then.
@@ -84,7 +106,7 @@ The store's `load()` in `mobile/src/data/store.tsx` branches on role. A supervis
 
 ## Offline queue — read before changing flush rules
 
-`mobile/src/offline/queue.ts` carries a long note that is load-bearing. In short: attendance replays are safe (unique `(worker_id, date)` → 409 → dropped), cash entries are safe (`client_ref` is a UNIQUE idempotency key and the server returns the existing row), **transactions are not** — there is no natural key, so a replay pays a worker twice. `TRANSACTION_RETRY_IS_SAFE` stays false until `transactions` gains a `client_ref` the way `cash_entries` has one. Payroll settlement is never queued for the same reason.
+`mobile/src/offline/queue.ts` carries a long note that is load-bearing. In short: attendance replays are safe (unique `(worker_id, date)` → 409 → dropped); cash entries and transactions are safe because both carry a UNIQUE `client_ref` and the server returns the existing row on a repeat. The store mints the `clientRef` **before the first online attempt** and reuses it if the write is queued - a fresh key per attempt would defeat the dedupe. Payroll settlement is never queued (it is computed from the balance at send time); it takes an optional `client_ref` for double-taps.
 
 ## Deliberate design decisions worth not "fixing"
 

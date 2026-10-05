@@ -5,6 +5,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, sta
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
+from app.core.clock import business_today
 from app.config import get_settings
 from app.dependencies import CurrentWorker, DbSession
 from app.models.advance_request import AdvanceRequest
@@ -271,8 +272,8 @@ async def upload_my_site_photo(
             detail=f"Images must be under {settings.max_image_bytes // (1024 * 1024)} MB",
         )
 
-    when = date or date_type.today()
-    if when > date_type.today():
+    when = date or business_today()
+    if when > business_today():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A photo cannot be dated in the future",

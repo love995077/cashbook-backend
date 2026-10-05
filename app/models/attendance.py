@@ -1,5 +1,6 @@
 from datetime import date as date_type
 from datetime import datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import (
@@ -7,6 +8,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Numeric,
     String,
     UniqueConstraint,
     func,
@@ -62,6 +64,34 @@ class Attendance(Base):
     )
 
     note: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # The day rate this day is worth, frozen when the day is first marked.
+    #
+    # WHY THE RATE IS STORED ON THE DAY
+    # ---------------------------------
+    # The wage below used to be recomputed from `users.daily_wage` every time
+    # the day was touched, so a worker who got a raise in October had every
+    # September day quietly repriced the next time one was corrected - or the
+    # next time the grid was resubmitted, because a resubmission re-syncs
+    # unchanged rows too. "Days already worked keep the rate they were worked
+    # at" was the intent; this column is what makes it true.
+    #
+    # Three states, and the difference between the first two matters:
+    #
+    #   NULL   a daily-rate day whose rate was not known when it was marked
+    #          (the worker was booked with a name only). It earns nothing YET,
+    #          and is priced the moment a rate is set - see
+    #          `price_unpriced_days` in app/services/integrity.py. Also every
+    #          row older than this column that had no wage; `reconcile_wages`
+    #          prices those.
+    #   0      a day that is not paid by the day at all: the worker was on
+    #          piece rate when it was marked, and their log pays them. Never
+    #          priced later, or the day would be paid twice.
+    #   > 0    the rate. The wage is this x 1 or x 0.5, forever, unless the
+    #          contractor explicitly re-prices (`reprice_days`).
+    #
+    # See app/services/wages.py.
+    wage_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
 
     # The WAGE `Transaction` this day earned, for a worker on a day rate.
     #

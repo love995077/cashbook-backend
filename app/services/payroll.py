@@ -21,6 +21,7 @@ from typing import Optional
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.clock import business_today
 from app.models.attendance import Attendance
 from app.models.enums import AttendanceStatus, PaymentMode, TransactionType
 from app.models.transaction import Transaction
@@ -57,7 +58,7 @@ def build_summary(
     `end_date` defaults to today. `start_date` left out means the whole of
     the worker's history, which is the usual request.
     """
-    end = end_date or date_type.today()
+    end = end_date or business_today()
 
     window = calculate_balance(db, worker.id, start_date, end)
     lifetime = calculate_balance(db, worker.id).balance

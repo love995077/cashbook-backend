@@ -20,18 +20,18 @@ a script that believed it was talking to a temporary file.
 An override is deliberately an ENV VAR rather than a parameter: it has to be
 visible in the command that runs, not buried in a caller's config object.
 
-WHAT THE OVERRIDE CANNOT DO
----------------------------
-Replay the whole chain on SQLite. The initial migration emits
-`DEFAULT (now())`, which MySQL has and SQLite does not, so `upgrade head`
-against an empty SQLite file fails on the very first revision. That is a
-property of the existing migrations, not of the override.
+ENGINES
+-------
+The chain builds PostgreSQL (production) and MySQL (the database being
+migrated away from) alike, from empty to head. The early revisions were
+written for MySQL, and the places where the two engines differ - enum types
+above all - go through app/core/migration_support.py. `alembic check` against
+either engine at head reports no difference from the models; the test suite
+asserts it (tests/test_migrations.py).
 
-So the override is for pointing a migration at a DIFFERENT MYSQL - a local
-container, a staging copy - rather than at a fundamentally different engine.
-To rehearse the whole chain, use the MySQL in docker-compose.yml. For testing
-application behaviour rather than migrations, the smoke scripts build their
-schema with `Base.metadata.create_all` and skip alembic entirely.
+What the chain cannot build is SQLite: the initial migration emits
+`DEFAULT (now())`, which SQLite does not have. The tests build SQLite schemas
+with `Base.metadata.create_all` instead.
 """
 
 import os
@@ -40,7 +40,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from app.config import get_settings
+from app.config import connect_args_for, get_settings, normalise_database_url
 
 # Importing the models registers every table on Base.metadata, which is what
 # `--autogenerate` compares the live database against. Without this import
@@ -57,7 +57,9 @@ settings = get_settings()
 
 # An explicit override wins; otherwise the app's own URL. See the module
 # docstring for why this is not simply `settings.sqlalchemy_url`.
-DATABASE_URL = os.environ.get("ALEMBIC_DATABASE_URL") or settings.sqlalchemy_url
+DATABASE_URL = normalise_database_url(
+    os.environ.get("ALEMBIC_DATABASE_URL") or settings.sqlalchemy_url
+)
 
 # Announced on every run. A migration is irreversible often enough that
 # knowing which server is about to receive it should not require reading the
@@ -79,6 +81,18 @@ target_metadata = Base.metadata
 COMPARE_SERVER_DEFAULT = False
 
 
+def include_object(obj, name, type_, reflected, compare_to):
+    """Leave the PostgreSQL-only case-insensitive indexes out of autogenerate.
+
+    They are expression indexes on lower(name), created and owned by revision
+    3b7d9e2a4c61; the models cannot declare them portably. Without this every
+    autogenerate run against PostgreSQL would propose dropping them.
+    """
+    if type_ == "index" and name and name.endswith("_ci"):
+        return False
+    return True
+
+
 def run_migrations_offline() -> None:
     """Emit SQL to stdout instead of running it (`alembic upgrade head --sql`)."""
     context.configure(
@@ -88,6 +102,7 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
         compare_server_default=COMPARE_SERVER_DEFAULT,
+        include_object=include_object,
     )
 
     with context.begin_transaction():
@@ -100,12 +115,15 @@ def run_migrations_online() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
-        # TLS for managed providers; see Settings.connect_args. Dropped for
-        # an overridden URL that is not MySQL: those args carry PyMySQL's
-        # `ssl` dict, and `sqlite3.connect()` rejects it outright - so without
-        # this the SQLite rehearsal the override exists to enable would fail
-        # on connect.
-        connect_args=settings.connect_args if DATABASE_URL.startswith("mysql") else {},
+        # Shaped for the engine actually being migrated, not the app's own:
+        # PyMySQL's `ssl` dict breaks psycopg and sqlite3 on connect, and an
+        # overridden URL may be either. The app's TLS settings apply only when
+        # the override is absent, i.e. when this IS the app's database.
+        connect_args=(
+            settings.connect_args
+            if "ALEMBIC_DATABASE_URL" not in os.environ
+            else connect_args_for(DATABASE_URL)
+        ),
     )
 
     with connectable.connect() as connection:
@@ -115,6 +133,7 @@ def run_migrations_online() -> None:
             # A changed column type would otherwise be ignored silently.
             compare_type=True,
             compare_server_default=COMPARE_SERVER_DEFAULT,
+            include_object=include_object,
         )
 
         with context.begin_transaction():

@@ -1,5 +1,6 @@
 from datetime import date as date_type
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated, Optional
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
@@ -57,6 +58,36 @@ class SiteRead(SiteBase):
     # without a lookup per row.
     supervisor_id: Optional[int] = None
     supervisor_name: Optional[str] = None
+
+
+class SiteOverview(BaseModel):
+    """One site's card on the site-selection Home screen.
+
+    Money is by the site stamped on each row; "still owed" and the crew counts
+    are about who is posted here now. See app/services/site_overview.py.
+    """
+
+    site_id: int
+    #: Active workers posted here.
+    crew_active: int = 0
+    #: Deactivated workers still recorded against this site.
+    crew_inactive: int = 0
+    #: Attendance rows for today at this site, and what they add up to in days
+    #: (a half day counts half).
+    marked_today: int = 0
+    worked_today: Decimal = Decimal("0")
+    #: All time, by the site on each row.
+    wages_earned: Decimal = Decimal("0.00")
+    wages_paid: Decimal = Decimal("0.00")
+    cash_in: Decimal = Decimal("0.00")
+    expenses_paid: Decimal = Decimal("0.00")
+    petty_cash: Decimal = Decimal("0.00")
+    #: Positive balances of the active crew posted here.
+    outstanding_payable: Decimal = Decimal("0.00")
+    #: Wages paid out, expenses and petty cash at this site since the 1st.
+    month_spend: Decimal = Decimal("0.00")
+    #: The business day these were counted on.
+    today: date_type
 
 
 class SitePhotoRead(BaseModel):

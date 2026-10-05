@@ -112,6 +112,10 @@ class PayrollSummary(BaseModel):
 class PayrollSettleRequest(PayrollWindow):
     payment_mode: PaymentMode = PaymentMode.CASH
     note: Optional[str] = Field(default=None, max_length=255)
+    # Idempotency key for the clearing PAYMENT. A second tap - or a retry whose
+    # first attempt committed - with the same key gets the first settlement
+    # back rather than an error or a second payment.
+    client_ref: Optional[str] = Field(default=None, min_length=1, max_length=64)
 
 
 class PayrollSettlement(BaseModel):

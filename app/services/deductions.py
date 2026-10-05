@@ -37,16 +37,14 @@ from app.models.deduction import AutoDeduction, DeductionInstallment
 from app.models.enums import AttendanceStatus
 from app.models.transaction import Transaction
 from app.services.ledger import CENTS, ZERO
+from app.services.wages import EARNING_STATUSES, HALF
 
-# Attendance that earns a day, and therefore a day's deduction. An absence
-# takes nothing off: there were no wages to take it from, and quietly
-# deepening a worker's debt on a day they did not work is how an installment
-# arrangement turns into a trap.
-EARNING_STATUSES = frozenset({AttendanceStatus.PRESENT, AttendanceStatus.HALF_DAY})
-
-# A half day recovers half an installment — the same proportion the payroll
-# summary already uses for `days_worked`, so the two cannot drift apart.
-HALF = Decimal("0.5")
+# `EARNING_STATUSES` and `HALF` come from app/services/wages.py. Attendance
+# that earns a day earns a day's deduction too; an absence takes nothing off -
+# there were no wages to take it from, and quietly deepening a worker's debt on
+# a day they did not work is how an installment arrangement turns into a trap.
+# A half day recovers half an installment, the same proportion as its wage.
+# Imported rather than restated, so the two cannot drift apart.
 
 
 def _money(value: Optional[Decimal]) -> Decimal:
@@ -72,6 +70,13 @@ def active_plans(db: Session, worker_ids: list[int]) -> dict[int, AutoDeduction]
             AutoDeduction.balance_remaining > ZERO,
         )
         .order_by(AutoDeduction.id)
+        # Locked for the rest of the request. Two requests taking different
+        # days off one plan at once would otherwise each recompute
+        # `balance_remaining` from a sum that cannot see the other's
+        # uncommitted installment, and the later commit would overwrite the
+        # earlier one's figure - a debt that reads higher than it is. Under
+        # the lock the second waits, then sums both. (A no-op on SQLite.)
+        .with_for_update()
     ).all()
 
     # Oldest wins if a second plan ever got past the guard — recovering the
@@ -155,6 +160,75 @@ def apply_installment(
 
     recompute_balance(db, plan)
     return installment
+
+
+def apply_installment_for(
+    db: Session, worker_id: int, when: date_type, status: AttendanceStatus
+) -> Optional[DeductionInstallment]:
+    """Take the day's installment off this worker's active plan, if they have one."""
+    plan = active_plans(db, [worker_id]).get(worker_id)
+    if plan is None:
+        return None
+    return apply_installment(db, plan, when, status)
+
+
+def resettle_installment(
+    db: Session,
+    worker_id: int,
+    old_date: date_type,
+    old_status: AttendanceStatus,
+    new_date: date_type,
+    new_status: AttendanceStatus,
+) -> Optional[DeductionInstallment]:
+    """Move a day's installment to match a corrected attendance row.
+
+    A day marked present under an active plan takes that day's deduction.
+    Correcting the day to absent has to give it back, or the worker quietly
+    pays an installment for a day they did not work — which is the exact thing
+    `EARNING_STATUSES` exists to prevent, and an edit must not be a way around
+    it.
+
+    EVERY PATH THAT CHANGES A DAY'S STATUS COMES THROUGH HERE: the single
+    correction, an overwriting grid resubmission, a rain-out over a day
+    already marked present, a QR re-scan, and an unmark (with ABSENT as the
+    new status, which is "give it back and take nothing"). The first version
+    only had the single correction, so a rain-out over a present day kept the
+    installment the present mark had taken.
+
+    Done by deleting the old day's row and re-applying against the new one,
+    rather than by arithmetic on `balance_remaining`: that column is a rollup
+    and `recompute_balance` is the only thing allowed to move it.
+
+    ONE THING IT DELIBERATELY DOES NOT DO
+    -------------------------------------
+    A plan closed by its final installment stays closed when that installment
+    is reversed, leaving a small balance on an inactive plan. `is_active=False`
+    means both "paid off" and "written off by hand" and the row cannot tell
+    them apart, so reopening one the contractor deliberately closed is the
+    worse mistake. The deductions screen shows the balance and can reopen it.
+    """
+    if (old_date, old_status) == (new_date, new_status):
+        return None
+
+    # Found through the installment itself rather than through `active_plans`,
+    # so a day can still be given back after its plan has closed.
+    stale = db.scalar(
+        select(DeductionInstallment).where(
+            DeductionInstallment.worker_id == worker_id,
+            DeductionInstallment.date == old_date,
+        )
+    )
+    if stale is not None:
+        # Locked for the same reason `active_plans` locks: the rollup below is
+        # recomputed from a sum another request could be changing.
+        plan = db.get(AutoDeduction, stale.deduction_id, with_for_update=True)
+        db.delete(stale)
+        # So the sum below does not still see the row being removed.
+        db.flush()
+        if plan is not None:
+            recompute_balance(db, plan)
+
+    return apply_installment_for(db, worker_id, new_date, new_status)
 
 
 def payroll_adjustment(

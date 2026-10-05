@@ -1,129 +1,91 @@
-# Production stack: MySQL + the FastAPI app behind gunicorn.
+# MoneyMate production stack: PostgreSQL + the FastAPI app behind gunicorn.
 #
-#   cp .env.production.example .env.production   # then fill in real secrets
-#   docker compose --env-file .env.production up -d --build
+#   cp .env.production.example .env      # then fill in real secrets
+#   docker compose up -d --build
 #
-# The schema is created once by the `migrate` service, not by the API workers.
-# See the AUTO_CREATE_TABLES note in app/config.py.
+# Order is handled by compose: `db` must pass its healthcheck, then `migrate`
+# runs `alembic upgrade head` and exits, then `api` starts. Every `up` re-runs
+# `migrate`, which is a no-op when the schema is already at head.
+#
+# The API listens on 127.0.0.1:8010 ONLY - a reverse proxy (Caddy) in front
+# terminates TLS for moneymate.lovee.dpdns.org. 8010 rather than 8000 so it
+# cannot collide with other apps on the same host.
 
-name: cashbook
+name: moneymate
 
 services:
   db:
-    image: mysql:8.4
+    image: postgres:16-alpine
     restart: unless-stopped
-    # Secrets come from the env file; nothing sensitive is written here.
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in the env file}
-      MYSQL_DATABASE: ${DB_NAME:-cash_book}
-      MYSQL_USER: ${DB_USER:?set DB_USER in the env file}
-      MYSQL_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in the env file}
-    command:
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
+      POSTGRES_USER: ${POSTGRES_USER:-moneymate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-moneymate}
+      # The server's clock zone; dates the app writes come from the business
+      # calendar (BUSINESS_TIMEZONE), never from here.
+      TZ: UTC
     volumes:
-      - db_data:/var/lib/mysql
-    # NOT published to the host by default. Uncomment only if you need to
-    # connect a GUI client, and understand that it exposes MySQL to the network.
-    # ports:
-    #   - "127.0.0.1:3306:3306"
+      - db_data:/var/lib/postgresql/data
+    # Published on the HOST's loopback only, for backups and for the one-off
+    # copy from the old database through an SSH tunnel. Never reachable from
+    # the network.
+    ports:
+      - "127.0.0.1:${DB_HOST_PORT:-15432}:5432"
     healthcheck:
-      # Other services wait on this, so the app never starts against a database
-      # that is still initialising.
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-moneymate} -d ${POSTGRES_DB:-moneymate}"]
+      interval: 5s
       timeout: 5s
-      retries: 10
-      start_period: 40s
+      retries: 20
     networks:
       - internal
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # One-shot: creates the tables, then exits. Run before the API is useful, and
-  # again after any model change. Replace with `alembic upgrade head` once
-  # migrations exist — create_all cannot alter an existing table.
+  # One-shot: brings the schema to head, then exits. The API waits for it.
   migrate:
     build:
       context: .
       dockerfile: Dockerfile
+    image: moneymate-api:latest
     restart: "no"
-    command: ["python", "scripts/create_tables.py"]
-    environment:
-      DB_HOST: db
-      DB_PORT: "3306"
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      DB_NAME: ${DB_NAME:-cash_book}
-      AUTO_CREATE_TABLES: "true"
+    command: ["alembic", "upgrade", "head"]
+    environment: &db_env
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-moneymate}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-moneymate}
+      AUTO_CREATE_TABLES: "false"
+      BUSINESS_TIMEZONE: ${BUSINESS_TIMEZONE:-Asia/Kolkata}
     depends_on:
       db:
         condition: service_healthy
     networks:
       - internal
+    logging: *logging
 
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: moneymate-api:latest
     restart: unless-stopped
     environment:
-      # --- database -------------------------------------------------------
-      # `db` is the compose service name. A DB_HOST of localhost would point at
-      # the container itself, which is the usual first mistake here.
-      DB_HOST: db
-      DB_PORT: "3306"
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      DB_NAME: ${DB_NAME:-cash_book}
-      DB_ECHO: "false"
-      # The `migrate` service owns the schema.
-      AUTO_CREATE_TABLES: "false"
-
-      # --- auth -----------------------------------------------------------
-      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in the env file}
+      <<: *db_env
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-10080}
-
-      # --- clients --------------------------------------------------------
-      # "*" is a development default. Name the real origins in production.
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
-
-      # --- optional integrations -----------------------------------------
-      STT_PROVIDER: ${STT_PROVIDER:-}
-      STT_MODEL: ${STT_MODEL:-small}
-      LLM_PROVIDER: ${LLM_PROVIDER:-}
-      LLM_MODEL: ${LLM_MODEL:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      NOTIFICATIONS_ENABLED: ${NOTIFICATIONS_ENABLED:-false}
-      NOTIFY_PROVIDER: ${NOTIFY_PROVIDER:-}
-      LARGE_ADVANCE_THRESHOLD: ${LARGE_ADVANCE_THRESHOLD:-3000}
-      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
-      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
-      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-}
-      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
-      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
-
-      # --- media uploads (Phase 9) -----------------------------------------
-      # Site photos and voice notes land on the volume mounted below. This
-      # path is INSIDE the container; the named volume is what makes it
-      # survive a rebuild.
-      MEDIA_BACKEND: ${MEDIA_BACKEND:-local}
+      MEDIA_BACKEND: local
       MEDIA_ROOT: /app/media
       MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-12582912}
       MAX_AUDIO_NOTE_BYTES: ${MAX_AUDIO_NOTE_BYTES:-5242880}
-
-      # --- server ---------------------------------------------------------
-      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-4}
+      NOTIFICATIONS_ENABLED: ${NOTIFICATIONS_ENABLED:-false}
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-3}
+      GUNICORN_BIND: 0.0.0.0:8000
     volumes:
-      # Without this the gallery is wiped on every `docker compose up --build`,
-      # and it is the reason `api` cannot simply be scaled to two replicas:
-      # a local named volume is not shared between hosts. Move
-      # MEDIA_BACKEND to s3 before scaling out.
+      # Photos and voice notes. Without the volume they vanish on rebuild.
       - media_data:/app/media
     ports:
-      # Bound to loopback: put a TLS-terminating proxy in front rather than
-      # exposing the app directly. Change to "8000:8000" only for a private
-      # network you control.
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${API_HOST_PORT:-8010}:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -131,11 +93,7 @@ services:
         condition: service_completed_successfully
     networks:
       - internal
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *logging
 
 volumes:
   db_data:

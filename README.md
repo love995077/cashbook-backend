@@ -519,3 +519,34 @@ Implement the two AI providers, then worker summaries and editing or voiding
 past entries. `transactions` should also gain a nullable UNIQUE `client_ref`,
 the way `cash_entries` already has, so the mobile offline queue can replay a
 worker advance safely instead of surfacing an ambiguous failure.
+
+---
+
+## Ledger integrity and site-first (October 2026)
+
+Production moved from Render + Aiven MySQL to PostgreSQL on Oracle Cloud - see
+`DEPLOYMENT.md`. Tests: `pytest` (see `CLAUDE.md`, "Verification").
+
+| Method | Path | Who | What |
+| --- | --- | --- | --- |
+| GET | `/contractor/integrity/wages` | admin | Audit every day against its wage. `consistent: true` is the proof the ledger matches attendance. |
+| POST | `/contractor/integrity/wages/reconcile?apply=false` | admin | Fix days whose wage is missing or wrong. Dry run by default; reports per worker how balances would move. |
+| GET | `/contractor/sites/overview` | admin | Every site's Home card: crew, today's marks, owed, spend this month. |
+| GET | `/contractor/summary?site_id=` | admin | The cash-box figures for one site. Also `/contractor/analytics?site_id=`, `/contractor/cash-entries?site_id=`. |
+| GET | `/contractor/workers?site_id=&include_inactive=` | staff | One site's crew (`site_id=0`: posted nowhere), deactivated included on request. |
+| GET | `/api/reports/*?site_id=` | admin | Every report narrowed to one site, by the site recorded on each row. |
+| DELETE | `/contractor/workers/{id}?last_day=` | admin | Deactivate; days after `last_day` (default today) can no longer be marked. |
+| PUT | `/contractor/workers/{id}` | admin | Now also `reprice_existing` / `reprice_from`; returns `days_priced` / `days_repriced`. |
+
+Behaviour worth knowing:
+
+- Marking a day writes its WAGE in the same transaction, at the rate frozen on
+  the day (`attendance.wage_rate`); a later raise never reprices it. A day
+  marked while the worker had no rate is priced when one is set.
+- Every money row carries `site_id`; site figures follow it, so a moved or
+  deactivated worker's history stays on the site where it happened.
+- `client_ref` makes `POST /contractor/transactions` and `POST /payroll/settle`
+  safe to retry.
+- "Today" is the business date in `BUSINESS_TIMEZONE` (Asia/Kolkata), not the
+  server's UTC date.
+

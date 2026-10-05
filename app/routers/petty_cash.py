@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import joinedload
 
+from app.core.clock import business_today
 from app.dependencies import CurrentContractor, DbSession, require_own_site
 from app.models.petty_cash import PettyCash
 from app.schemas.petty_cash import PettyCashCreate, PettyCashRead, PettyCashTotals
@@ -67,8 +68,8 @@ def add_petty_cash(
     """Log one cash outflow against this site."""
     require_own_site(db, contractor, site_id)
 
-    when = payload.date or date_type.today()
-    if when > date_type.today():
+    when = payload.date or business_today()
+    if when > business_today():
         # The same rule the photo feed and the rain-out both apply: money that
         # has not been spent yet is a plan, not a ledger entry.
         raise HTTPException(
@@ -106,7 +107,7 @@ def read_petty_cash_totals(
     fetching it separately would cost a second round trip for one glance.
     """
     require_own_site(db, contractor, site_id)
-    end = end_date or date_type.today()
+    end = end_date or business_today()
 
     total, count = db.execute(
         select(func.coalesce(func.sum(PettyCash.amount), 0), func.count()).where(

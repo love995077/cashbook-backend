@@ -36,6 +36,15 @@ class TransactionCreate(TransactionBase):
         default=None, gt=0, max_digits=10, decimal_places=2
     )
 
+    # The app's idempotency key. A repeat of a key already stored returns the
+    # stored row instead of writing a second one - see
+    # `Transaction.client_ref` and mobile/src/offline/queue.ts.
+    client_ref: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+    # The site this money belongs to. Left out, it is the site the worker is
+    # posted to right now - see `Transaction.site_id`.
+    site_id: Optional[int] = Field(default=None, gt=0)
+
     @model_validator(mode="after")
     def _check_installments(self) -> "TransactionCreate":
         if self.daily_deduction is None:
@@ -70,6 +79,8 @@ class TransactionRead(TransactionBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    #: The site this money is attributed to; null when it belongs to none.
+    site_id: Optional[int] = None
     #: The installment plan opened against this advance, when there is one.
     deduction_id: Optional[int] = None
     # Derived from audio_note_path at read time; see app/services/storage.py.

@@ -1,5 +1,6 @@
 """Downloadable reports: PDF statements for a worker, PDF and CSV for the job."""
 
+from collections import defaultdict
 from datetime import date as date_type
 from datetime import timedelta
 from decimal import Decimal
@@ -7,14 +8,15 @@ from typing import Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import joinedload
 
+from app.core.clock import business_today
 from app.dependencies import CurrentContractor, CurrentUser, DbSession
 from app.models.attendance import Attendance
 from app.models.cash import CashEntry
 from app.models.petty_cash import PettyCash
-from app.models.enums import AttendanceStatus, UserRole
+from app.models.enums import UserRole
 from app.models.site import Site
 from app.models.transaction import Transaction
 from app.models.user import User
@@ -24,6 +26,7 @@ from app.services.csv_report import filename as csv_filename
 from app.services.csv_report import monthly_csv, transactions_csv
 from app.services.ledger import calculate_balance
 from app.services.pdf_report import build_business_report, build_worker_statement
+from app.services.wages import weight
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
@@ -70,7 +73,7 @@ def worker_statement_pdf(
     """Build the statement and return it as a downloadable file."""
     worker = _authorise(db, user, worker_id)
 
-    today = date_type.today()
+    today = business_today()
     period_end = end_date or today
     if start_date is not None and start_date > period_end:
         raise HTTPException(
@@ -198,10 +201,27 @@ def _export_scope(db: DbSession, user: User, worker_id: Optional[int]) -> tuple[
     return chosen, chosen[0].name
 
 
+def _report_site(db: DbSession, user: User, site_id: Optional[int]) -> Optional[Site]:
+    """The site a report is narrowed to, if the caller may see it.
+
+    A contractor must own it - someone else's site is a 404, like everywhere
+    else. A worker's export is already only their own rows, so narrowing it by
+    a site cannot reveal anything and is simply applied.
+    """
+    if site_id is None:
+        return None
+    if user.role is UserRole.WORKER:
+        return db.get(Site, site_id)
+    site = db.get(Site, site_id)
+    if site is None or site.contractor_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Site not found")
+    return site
+
+
 def _window(
     start_date: Optional[date_type], end_date: Optional[date_type]
 ) -> tuple[Optional[date_type], date_type]:
-    period_end = end_date or date_type.today()
+    period_end = end_date or business_today()
     if start_date is not None and start_date > period_end:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -222,9 +242,13 @@ def transactions_export(
     worker_id: Optional[int] = Query(default=None, description="Contractors only: one worker."),
     start_date: Optional[date_type] = Query(default=None),
     end_date: Optional[date_type] = Query(default=None),
+    site_id: Optional[int] = Query(
+        default=None, gt=0, description="Only what happened at this site."
+    ),
 ) -> Response:
     workers, owner = _export_scope(db, user, worker_id)
     start, end = _window(start_date, end_date)
+    site = _report_site(db, user, site_id)
 
     ids = [worker.id for worker in workers]
     rows: list[Transaction] = []
@@ -234,10 +258,16 @@ def transactions_export(
         )
         if start is not None:
             stmt = stmt.where(Transaction.date >= start)
+        if site_id is not None:
+            # By the site on the row: a worker moved or deactivated since still
+            # appears on the site where the money moved.
+            stmt = stmt.where(Transaction.site_id == site_id)
         rows = list(db.scalars(stmt.order_by(Transaction.date, Transaction.id)).all())
 
     payload = transactions_csv(rows, {worker.id: worker for worker in workers})
-    return _csv_response(payload, csv_filename("transactions", owner, start, end))
+    return _csv_response(
+        payload, csv_filename("transactions", site.name if site else owner, start, end)
+    )
 
 
 @router.get(
@@ -252,9 +282,13 @@ def attendance_export(
     worker_id: Optional[int] = Query(default=None, description="Contractors only: one worker."),
     start_date: Optional[date_type] = Query(default=None),
     end_date: Optional[date_type] = Query(default=None),
+    site_id: Optional[int] = Query(
+        default=None, gt=0, description="Only what happened at this site."
+    ),
 ) -> Response:
     workers, owner = _export_scope(db, user, worker_id)
     start, end = _window(start_date, end_date)
+    site = _report_site(db, user, site_id)
 
     ids = [worker.id for worker in workers]
     rows: list[Attendance] = []
@@ -262,10 +296,14 @@ def attendance_export(
         stmt = select(Attendance).where(Attendance.worker_id.in_(ids), Attendance.date <= end)
         if start is not None:
             stmt = stmt.where(Attendance.date >= start)
+        if site_id is not None:
+            stmt = stmt.where(Attendance.site_id == site_id)
         rows = list(db.scalars(stmt.order_by(Attendance.date, Attendance.id)).all())
 
     payload = attendance_csv(rows, {worker.id: worker for worker in workers})
-    return _csv_response(payload, csv_filename("attendance", owner, start, end))
+    return _csv_response(
+        payload, csv_filename("attendance", site.name if site else owner, start, end)
+    )
 
 
 @router.get(
@@ -279,9 +317,13 @@ def cash_entries_export(
     db: DbSession,
     start_date: Optional[date_type] = Query(default=None),
     end_date: Optional[date_type] = Query(default=None),
+    site_id: Optional[int] = Query(
+        default=None, gt=0, description="Only what happened at this site."
+    ),
 ) -> Response:
     """Contractor only - a worker has no visibility of the site cash box."""
     start, end = _window(start_date, end_date)
+    site = _report_site(db, contractor, site_id)
 
     stmt = (
         select(CashEntry)
@@ -290,10 +332,14 @@ def cash_entries_export(
     )
     if start is not None:
         stmt = stmt.where(CashEntry.date >= start)
+    if site_id is not None:
+        stmt = stmt.where(CashEntry.site_id == site_id)
     entries = list(db.scalars(stmt.order_by(CashEntry.date, CashEntry.id)).all())
 
     payload = cash_entries_csv(entries)
-    return _csv_response(payload, csv_filename("expenses", contractor.name, start, end))
+    return _csv_response(
+        payload, csv_filename("expenses", site.name if site else contractor.name, start, end)
+    )
 
 
 @router.get(
@@ -307,36 +353,62 @@ def business_report_pdf(
     db: DbSession,
     start_date: Optional[date_type] = Query(default=None),
     end_date: Optional[date_type] = Query(default=None),
+    site_id: Optional[int] = Query(
+        default=None, gt=0, description="Only what happened at this site."
+    ),
 ) -> Response:
-    """Cash in, cash out, the crew, and every expense - on one document."""
+    """Cash in, cash out, the crew, and every expense - on one document.
+
+    With `site_id`, the same document for one site. Its crew is everyone who
+    worked or was paid there - deactivated workers and workers since moved
+    elsewhere included, because their days and their money happened here -
+    plus whoever is posted there now.
+    """
     start, end = _window(start_date, end_date)
-    today = date_type.today()
+    today = business_today()
+    site = _report_site(db, contractor, site_id)
 
-    crew = list(
-        db.scalars(
-            select(User)
-            .where(User.contractor_id == contractor.id, User.role == UserRole.WORKER)
-            .order_by(User.name)
-        ).all()
+    crew_stmt = select(User).where(
+        User.contractor_id == contractor.id, User.role == UserRole.WORKER
     )
-
-    # Days worked counts a half day as half. The balance is deliberately
-    # lifetime rather than period: a partial view of what is owed would be
-    # read as the whole thing.
-    weight = {
-        AttendanceStatus.PRESENT: Decimal("1"),
-        AttendanceStatus.HALF_DAY: Decimal("0.5"),
-        AttendanceStatus.ABSENT: Decimal("0"),
-    }
-    crew_rows: list[tuple[User, Decimal, Decimal]] = []
-    for worker in crew:
-        att_stmt = select(Attendance.status).where(
-            Attendance.worker_id == worker.id, Attendance.date <= end
+    if site_id is not None:
+        crew_stmt = crew_stmt.where(
+            or_(
+                User.site_id == site_id,
+                User.id.in_(select(Attendance.worker_id).where(Attendance.site_id == site_id)),
+                User.id.in_(select(Transaction.worker_id).where(Transaction.site_id == site_id)),
+            )
         )
+    crew = list(db.scalars(crew_stmt.order_by(User.name)).all())
+
+    # Days worked counts a half day as half and a rain-out or an absence as
+    # nothing - the same weights the wage uses (app/services/wages.py), so the
+    # report cannot count a day the ledger did not pay. The first version kept
+    # its own table, left rain-out out of it, and raised KeyError on the first
+    # rained-out day in the period: the whole PDF answered 500.
+    #
+    # The balance is deliberately lifetime rather than period: a partial view
+    # of what is owed would be read as the whole thing.
+    #
+    # One grouped query for the whole crew, not one per worker.
+    days_by_worker: dict[int, Decimal] = defaultdict(lambda: Decimal("0"))
+    if crew:
+        att_stmt = select(
+            Attendance.worker_id, Attendance.status, func.count()
+        ).where(Attendance.worker_id.in_([w.id for w in crew]), Attendance.date <= end)
         if start is not None:
             att_stmt = att_stmt.where(Attendance.date >= start)
-        days = sum((weight[row] for row in db.scalars(att_stmt).all()), Decimal("0"))
-        crew_rows.append((worker, days, calculate_balance(db, worker.id).balance))
+        if site_id is not None:
+            att_stmt = att_stmt.where(Attendance.site_id == site_id)
+        for worker_id, day_status, count in db.execute(
+            att_stmt.group_by(Attendance.worker_id, Attendance.status)
+        ).all():
+            days_by_worker[worker_id] += weight(day_status) * count
+
+    crew_rows: list[tuple[User, Decimal, Decimal]] = [
+        (worker, days_by_worker[worker.id], calculate_balance(db, worker.id).balance)
+        for worker in crew
+    ]
 
     entry_stmt = (
         select(CashEntry)
@@ -345,11 +417,13 @@ def business_report_pdf(
     )
     if start is not None:
         entry_stmt = entry_stmt.where(CashEntry.date >= start)
+    if site_id is not None:
+        entry_stmt = entry_stmt.where(CashEntry.site_id == site_id)
     entries = list(db.scalars(entry_stmt.order_by(CashEntry.date, CashEntry.id)).all())
 
-    summary = build_summary(db, contractor.id, start, end)
+    summary = build_summary(db, contractor.id, start, end, site_id)
     # Only the category breakdown is used here; the bars belong on screen.
-    breakdown = build_series(db, contractor.id, "month", start, end).by_category
+    breakdown = build_series(db, contractor.id, "month", start, end, site_id).by_category
 
     pdf = build_business_report(
         contractor=contractor,
@@ -360,9 +434,10 @@ def business_report_pdf(
         start_date=start,
         end_date=end,
         generated_on=today,
+        site_name=site.name if site else None,
     )
 
-    name = csv_filename("report", contractor.name, start, end)[:-4] + ".pdf"
+    name = csv_filename("report", site.name if site else contractor.name, start, end)[:-4] + ".pdf"
     return Response(
         content=pdf,
         media_type="application/pdf",
@@ -390,6 +465,9 @@ def monthly_report(
         pattern=r"^\d{4}-\d{2}$",
         description="The month to export, as YYYY-MM",
         examples=["2026-09"],
+    ),
+    site_id: Optional[int] = Query(
+        default=None, gt=0, description="Only what happened at this site."
     ),
 ) -> Response:
     """Transactions, attendance and petty cash for one month, in one file.
@@ -423,6 +501,8 @@ def monthly_report(
         - timedelta(days=1)
     )
 
+    site = _report_site(db, contractor, site_id)
+
     crew = list(
         db.scalars(
             select(User).where(
@@ -432,6 +512,10 @@ def monthly_report(
     )
     workers = {worker.id: worker for worker in crew}
     worker_ids = list(workers)
+    # A site's month is the rows recorded there, whoever the worker is now.
+    tx_site = [Transaction.site_id == site_id] if site_id is not None else []
+    att_site = [Attendance.site_id == site_id] if site_id is not None else []
+    petty_site = [PettyCash.site_id == site_id] if site_id is not None else []
 
     transactions = (
         list(
@@ -441,6 +525,7 @@ def monthly_report(
                     Transaction.worker_id.in_(worker_ids),
                     Transaction.date >= start,
                     Transaction.date <= end,
+                    *tx_site,
                 )
                 .order_by(Transaction.date, Transaction.id)
             ).all()
@@ -457,6 +542,7 @@ def monthly_report(
                     Attendance.worker_id.in_(worker_ids),
                     Attendance.date >= start,
                     Attendance.date <= end,
+                    *att_site,
                 )
                 .order_by(Attendance.date, Attendance.id)
             ).all()
@@ -475,10 +561,17 @@ def monthly_report(
                 Site.contractor_id == contractor.id,
                 PettyCash.date >= start,
                 PettyCash.date <= end,
+                *petty_site,
             )
             .order_by(PettyCash.date, PettyCash.id)
         ).all()
     )
 
     payload = monthly_csv(month, transactions, attendance, petty, workers)
-    return _csv_response(payload, f"cashbook-{month}.csv")
+    label = f"-{_slug(site.name)}" if site else ""
+    return _csv_response(payload, f"cashbook-{month}{label}.csv")
+
+
+def _slug(text: str) -> str:
+    safe = "".join(char if char.isalnum() else "-" for char in text).strip("-")
+    return "-".join(part for part in safe.split("-") if part) or "site"

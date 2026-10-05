@@ -48,6 +48,7 @@ from app.models.site import Site
 from app.schemas.cash import CashSummary, CategoryTotal
 from app.schemas.invoice import InvoicePreview
 from app.schemas.ledger import BalanceSummary
+from app.services.wages import weight
 
 FONT_REGULAR = "Helvetica"
 FONT_BOLD = "Helvetica-Bold"
@@ -65,10 +66,14 @@ BAND = colors.HexColor("#F4F4F6")
 # built-in encoding, so amounts are written as "Rs." to stay legible.
 CURRENCY = "Rs."
 
+# Every member of AttendanceStatus must appear here. RAIN_OUT was missing, and
+# the statement looked each row up by key: the first rained-out day in a
+# worker's period turned their PDF into a 500.
 STATUS_LABELS = {
     AttendanceStatus.PRESENT: "Present",
     AttendanceStatus.HALF_DAY: "Half day",
     AttendanceStatus.ABSENT: "Absent",
+    AttendanceStatus.RAIN_OUT: "Rained out",
 }
 
 TYPE_LABELS = {
@@ -270,10 +275,13 @@ def build_worker_statement(
     counts = {status: 0 for status in AttendanceStatus}
     for record in attendance:
         counts[record.status] += 1
-    # A half day is half a day worked; absences are not.
-    days_worked = counts[AttendanceStatus.PRESENT] + Decimal("0.5") * counts[
-        AttendanceStatus.HALF_DAY
-    ]
+    # A half day is half a day worked; absences and rain-outs are not. The
+    # weights are the wage's own (app/services/wages.py), so the statement
+    # cannot count a day the ledger did not pay.
+    days_worked = sum(
+        (weight(day_status) * count for day_status, count in counts.items()),
+        Decimal("0"),
+    )
 
     story.append(Paragraph("ATTENDANCE", style["section"]))
     if attendance:
@@ -281,7 +289,8 @@ def build_worker_statement(
             Paragraph(
                 f"{counts[AttendanceStatus.PRESENT]} present, "
                 f"{counts[AttendanceStatus.HALF_DAY]} half day, "
-                f"{counts[AttendanceStatus.ABSENT]} absent "
+                f"{counts[AttendanceStatus.ABSENT]} absent, "
+                f"{counts[AttendanceStatus.RAIN_OUT]} rained out "
                 f"- {days_worked:g} days worked.",
                 style["note"],
             )
@@ -349,8 +358,12 @@ def build_business_report(
     start_date: Optional[date_type],
     end_date: date_type,
     generated_on: date_type,
+    site_name: Optional[str] = None,
 ) -> bytes:
     """The whole job on paper: what came in, what went out, and to whom.
+
+    `site_name` titles a report narrowed to one site, so a printout says which
+    job it covers rather than reading like the whole business.
 
     `crew` is (worker, days worked, balance owed) per worker, and `cash_entries`
     are the general expenses and receipts, oldest first. The worker statement
@@ -371,13 +384,15 @@ def build_business_report(
         rightMargin=18 * mm,
         topMargin=16 * mm,
         bottomMargin=22 * mm,
-        title=f"Cashbook report - {contractor.name}",
+        title=f"Cashbook report - {site_name or contractor.name}",
         author="Cashbook",
         subject=f"Business report for {period_label}",
     )
 
     story: list = []
-    story.append(Paragraph("Cashbook report", style["title"]))
+    story.append(
+        Paragraph(f"Site report: {site_name}" if site_name else "Cashbook report", style["title"])
+    )
     story.append(Paragraph(f"{contractor.name} | {period_label}", style["subtitle"]))
     story.append(Spacer(1, 10))
 

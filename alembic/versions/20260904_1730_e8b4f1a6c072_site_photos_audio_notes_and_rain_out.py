@@ -36,6 +36,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from app.core.migration_support import add_enum_value, is_postgres
+
 # revision identifiers, used by Alembic.
 revision: str = 'e8b4f1a6c072'
 down_revision: Union[str, Sequence[str], None] = 'd5a1e7c93b26'
@@ -86,32 +88,43 @@ def upgrade() -> None:
             table, sa.Column('audio_note_path', sa.String(length=255), nullable=True)
         )
 
-    op.alter_column(
-        'attendance',
-        'status',
-        existing_type=STATUS_WITHOUT_RAIN_OUT,
-        type_=STATUS_WITH_RAIN_OUT,
-        existing_nullable=False,
-    )
+    if is_postgres():
+        # The members live on the TYPE, not the column, so the column-level
+        # MODIFY below would change nothing. Appending is the PostgreSQL
+        # equivalent and, like the MySQL one, rewrites no existing row.
+        add_enum_value('attendance_status', 'rain_out')
+    else:
+        op.alter_column(
+            'attendance',
+            'status',
+            existing_type=STATUS_WITHOUT_RAIN_OUT,
+            type_=STATUS_WITH_RAIN_OUT,
+            existing_nullable=False,
+        )
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
+    """Downgrade schema.
+
+    Tables are dropped without dropping their indexes first: MySQL refuses to
+    drop an index that backs a foreign key ("needed in a foreign key
+    constraint"), and dropping the table removes its indexes on every engine.
+    """
     # Lossy, and deliberately explicit about it: a rained-out day becomes a
     # plain absence rather than being silently blanked by the narrowing below.
     op.execute("UPDATE attendance SET status = 'absent' WHERE status = 'rain_out'")
-    op.alter_column(
-        'attendance',
-        'status',
-        existing_type=STATUS_WITH_RAIN_OUT,
-        type_=STATUS_WITHOUT_RAIN_OUT,
-        existing_nullable=False,
-    )
+    # PostgreSQL cannot drop a member from an enum type. The value is left on
+    # the type, unused, which is harmless - no row holds it any more.
+    if not is_postgres():
+        op.alter_column(
+            'attendance',
+            'status',
+            existing_type=STATUS_WITH_RAIN_OUT,
+            type_=STATUS_WITHOUT_RAIN_OUT,
+            existing_nullable=False,
+        )
 
     for table in reversed(AUDIO_TABLES):
         op.drop_column(table, 'audio_note_path')
 
-    op.drop_index(op.f('ix_site_photos_uploaded_by'), table_name='site_photos')
-    op.drop_index(op.f('ix_site_photos_date'), table_name='site_photos')
-    op.drop_index(op.f('ix_site_photos_site_id'), table_name='site_photos')
     op.drop_table('site_photos')

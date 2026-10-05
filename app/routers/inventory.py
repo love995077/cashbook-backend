@@ -25,9 +25,11 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.clock import business_today
 from app.config import get_settings
 from app.dependencies import CurrentSiteStaff, DbSession, require_site_access
 from app.models.enums import MaterialUnit
@@ -55,6 +57,30 @@ def _read_receipt(
     return read
 
 
+def _find_stock(db: Session, site_id: int, item_name: str) -> Optional[SiteInventory]:
+    """The site's row for this item, matched without regard to case, locked.
+
+    Case-insensitive because the old database was: MySQL's collation treated
+    "Cement" and "cement" as one item, so a delivery typed either way landed on
+    the same row. PostgreSQL compares exactly, and the same two deliveries
+    would have opened two rows each holding part of the stock - neither of
+    which answers "how many bags are left". The migration adds a matching
+    unique index on lower(item_name), so this is not only a convention.
+
+    Locked because the caller is about to add to it: two deliveries of one item
+    accepted at the same moment would otherwise both read 10, both write their
+    own sum, and one delivery would vanish from the stock.
+    """
+    return db.scalar(
+        select(SiteInventory)
+        .where(
+            SiteInventory.site_id == site_id,
+            func.lower(SiteInventory.item_name) == item_name.lower(),
+        )
+        .with_for_update()
+    )
+
+
 def _upsert_stock(
     db: Session, site_id: int, item_name: str, quantity: Decimal, unit: MaterialUnit
 ) -> SiteInventory:
@@ -65,28 +91,33 @@ def _upsert_stock(
     than converted: nobody here knows how many kg are in a brass of sand, and
     guessing would corrupt the only number this table exists to hold.
     """
-    row = db.scalar(
-        select(SiteInventory).where(
-            SiteInventory.site_id == site_id, SiteInventory.item_name == item_name
-        )
-    )
+    row = _find_stock(db, site_id, item_name)
 
     if row is None:
-        row = SiteInventory(
-            site_id=site_id,
-            item_name=item_name,
-            quantity_in_stock=quantity,
-            unit=unit,
-        )
-        db.add(row)
-        db.flush()
-        return row
+        try:
+            # A SAVEPOINT around the insert, with the add inside it, so losing
+            # a race to create the same item rolls back this row alone.
+            with db.begin_nested():
+                row = SiteInventory(
+                    site_id=site_id,
+                    item_name=item_name,
+                    quantity_in_stock=quantity,
+                    unit=unit,
+                )
+                db.add(row)
+                db.flush()
+            return row
+        except IntegrityError:
+            # Another delivery created the item a moment ago. Add to that one.
+            row = _find_stock(db, site_id, item_name)
+            if row is None:
+                raise
 
     if row.unit is not unit:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"{item_name} is already tracked at this site in "
+                f"{row.item_name} is already tracked at this site in "
                 f"{row.unit.value.replace('_', ' ')}. Record this delivery in the "
                 "same unit, or receive it under a different item name."
             ),
@@ -184,8 +215,8 @@ async def receive_material(
             detail="The item name must not be blank",
         )
 
-    when = date or date_type.today()
-    if when > date_type.today():
+    when = date or business_today()
+    if when > business_today():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A delivery cannot be dated in the future",

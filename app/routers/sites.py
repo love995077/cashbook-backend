@@ -21,10 +21,11 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.clock import business_today
 from app.config import get_settings
 from app.dependencies import (
     CurrentContractor,
@@ -34,7 +35,8 @@ from app.dependencies import (
     require_site_access,
 )
 from app.models.attendance import Attendance
-from app.models.enums import AttendanceStatus, UserRole
+from app.models.cash import CashEntry
+from app.models.enums import AttendanceStatus, UserRole, WorkShift
 from app.models.inventory import MaterialReceipt
 from app.models.invoice import Invoice
 from app.models.machinery import MachineryLog
@@ -43,11 +45,13 @@ from app.models.piece_rate import PieceRateLog
 from app.models.site import Site
 from app.models.site_photo import SitePhoto
 from app.models.tool import Tool
+from app.models.transaction import Transaction
 from app.models.user import User
 from app.schemas.attendance import AttendanceRead
 from app.schemas.site import (
     RainOutResult,
     SiteCreate,
+    SiteOverview,
     SitePhotoRead,
     SiteRead,
     SiteUpdate,
@@ -59,7 +63,8 @@ from app.services.storage import (
     public_url,
     store_upload,
 )
-from app.services.wages import sync_attendance_wage
+from app.services.attendance import DayOutcome, record_day
+from app.services.site_overview import build_site_overviews
 
 router = APIRouter(prefix="/contractor/sites", tags=["sites"])
 settings = get_settings()
@@ -188,6 +193,28 @@ def list_sites(
         _read_site(site, worker_counts.get(site.id, 0), photo_counts.get(site.id, 0))
         for site in sites
     ]
+
+
+@router.get("/overview", response_model=list[SiteOverview])
+def list_site_overviews(
+    contractor: CurrentContractor,
+    db: DbSession,
+    include_inactive: bool = Query(default=False),
+) -> list[SiteOverview]:
+    """Every site's card for the site-selection Home screen, in one request.
+
+    Admin only: the cards carry what each site has cost and what its crew is
+    owed, which is exactly the money a supervisor does not see. Declared
+    before `/{site_id}` so this static path is matched first.
+
+    Built from one grouped query per figure across every site, not one query
+    per site - see app/services/site_overview.py.
+    """
+    stmt = select(Site).where(Site.contractor_id == contractor.id)
+    if not include_inactive:
+        stmt = stmt.where(Site.is_active.is_(True))
+    sites = list(db.scalars(stmt.order_by(Site.is_active.desc(), Site.name)).all())
+    return build_site_overviews(db, sites, business_today())
 
 
 @router.post("", response_model=SiteRead, status_code=status.HTTP_201_CREATED)
@@ -342,6 +369,19 @@ def remove_site(
                 .select_from(PieceRateLog)
                 .where(PieceRateLog.site_id == site.id)
             ),
+            # Wages, advances and payments filed under this site. The FK is
+            # SET NULL so they would survive, but the site's own record of
+            # what it paid would not - that is history, not a typo.
+            "ledger entries": db.scalar(
+                select(func.count())
+                .select_from(Transaction)
+                .where(Transaction.site_id == site.id)
+            ),
+            "expenses": db.scalar(
+                select(func.count())
+                .select_from(CashEntry)
+                .where(CashEntry.site_id == site.id)
+            ),
         }
         blocking = [f"{count} {label}" for label, count in history.items() if count]
         if blocking:
@@ -441,8 +481,8 @@ async def upload_site_photo(
             detail=f"Images must be under {settings.max_image_bytes // (1024 * 1024)} MB",
         )
 
-    when = date or date_type.today()
-    if when > date_type.today():
+    when = date or business_today()
+    if when > business_today():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A photo cannot be dated in the future",
@@ -533,8 +573,8 @@ def mark_site_rained_out(
     `overwrite=false` to leave existing marks alone.
     """
     site = _reachable(db, staff, site_id)
-    when = date or date_type.today()
-    if when > date_type.today():
+    when = date or business_today()
+    if when > business_today():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A day cannot be rained out before it happens",
@@ -566,38 +606,31 @@ def mark_site_rained_out(
     existing = {
         row.worker_id: row
         for row in db.scalars(
-            select(Attendance).where(
-                Attendance.worker_id.in_(worker_ids), Attendance.date == when
-            )
+            select(Attendance)
+            .where(Attendance.worker_id.in_(worker_ids), Attendance.date == when)
+            .with_for_update()
         ).all()
     }
 
-    created = updated = unchanged = 0
+    counts = {outcome: 0 for outcome in DayOutcome}
     for worker in crew:
         row = existing.get(worker.id)
-        if row is None:
-            db.add(
-                Attendance(
-                    worker_id=worker.id,
-                    date=when,
-                    site_id=site.id,
-                    status=AttendanceStatus.RAIN_OUT,
-                )
-            )
-            created += 1
-        elif row.status is AttendanceStatus.RAIN_OUT:
-            unchanged += 1
-        elif overwrite:
-            row.status = AttendanceStatus.RAIN_OUT
-            if row.site_id is None:
-                row.site_id = site.id
-            # A day that was marked present had earned its wage. The site
-            # standing down takes that back, or the crew is paid for a day
-            # the weather cancelled - see app/services/wages.py.
-            sync_attendance_wage(db, row, worker)
-            updated += 1
-        else:
-            unchanged += 1
+        # A day marked present had earned its wage and taken its installment.
+        # The site standing down takes both back - see record_day - or the
+        # crew is paid, and charged, for a day the weather cancelled.
+        _, outcome, _ = record_day(
+            db,
+            worker,
+            when,
+            AttendanceStatus.RAIN_OUT,
+            # The shift is not what a rain-out is about; a night-shift row
+            # stays a night-shift row.
+            shift=row.shift if row is not None else WorkShift.DAY,
+            site_id=site.id,
+            overwrite=overwrite,
+            existing=row,
+        )
+        counts[outcome] += 1
 
     db.commit()
 
@@ -605,9 +638,9 @@ def mark_site_rained_out(
         site_id=site.id,
         site_name=site.name,
         date=when,
-        created=created,
-        updated=updated,
-        unchanged=unchanged,
+        created=counts[DayOutcome.CREATED],
+        updated=counts[DayOutcome.UPDATED],
+        unchanged=counts[DayOutcome.UNCHANGED],
         worker_ids=worker_ids,
     )
 
@@ -619,13 +652,18 @@ def read_site_attendance(
     db: DbSession,
     date: Optional[date_type] = Query(default=None, description="Defaults to today"),
 ) -> list[Attendance]:
-    """One day's attendance for the crew posted to this site.
+    """One day's attendance at this site.
 
     Lets the app show the grid straight after a rain-out without refetching
     every worker's whole ledger.
+
+    By the site recorded on each row - where the day was worked - so a worker
+    moved to another job, or deactivated, still shows on the days they worked
+    here. A row with no site recorded (marked before rows carried one) is
+    shown for the crew posted here, which is where it most likely happened.
     """
     site = _reachable(db, staff, site_id)
-    when = date or date_type.today()
+    when = date or business_today()
 
     return list(
         db.scalars(
@@ -633,8 +671,11 @@ def read_site_attendance(
             .join(User, User.id == Attendance.worker_id)
             .where(
                 Attendance.date == when,
-                User.site_id == site.id,
                 User.contractor_id == site.contractor_id,
+                or_(
+                    Attendance.site_id == site.id,
+                    and_(Attendance.site_id.is_(None), User.site_id == site.id),
+                ),
             )
             .order_by(Attendance.worker_id)
         ).all()

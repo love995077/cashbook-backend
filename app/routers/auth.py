@@ -34,6 +34,17 @@ def register(payload: RegisterRequest, db: DbSession) -> TokenResponse:
             detail="An account with this phone number already exists",
         )
 
+    if payload.role is UserRole.WORKER and payload.contractor_id is not None:
+        # A worker joins a crew because the contractor adds them (POST
+        # /contractor/workers), never by naming one. Accepting the id here let
+        # anybody who guessed a contractor's number put themselves on that
+        # crew - into the attendance grid, the payroll, the cash totals. The
+        # app never sends it for a worker; only a direct call could.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Workers are added to a crew by their contractor, not at sign-up",
+        )
+
     if payload.contractor_id is not None:
         contractor = db.get(User, payload.contractor_id)
         if contractor is None or contractor.role is not UserRole.CONTRACTOR:

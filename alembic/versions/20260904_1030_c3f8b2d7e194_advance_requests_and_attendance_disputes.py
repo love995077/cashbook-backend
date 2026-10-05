@@ -20,6 +20,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from app.core.migration_support import is_postgres
+
 # revision identifiers, used by Alembic.
 revision: str = 'c3f8b2d7e194'
 down_revision: Union[str, Sequence[str], None] = 'a1c4f7d2b3e5'
@@ -60,9 +62,12 @@ def upgrade() -> None:
     # server_default backfills the rows already in the table; it is dropped
     # immediately afterwards so the column matches the model, which sets the
     # default in Python.
+    #
+    # `sa.false()` rather than the literal 0: MySQL reads both as 0, but
+    # PostgreSQL refuses an integer default on a boolean column outright.
     op.add_column(
         'attendance',
-        sa.Column('is_disputed', sa.Boolean(), nullable=False, server_default=sa.text('0')),
+        sa.Column('is_disputed', sa.Boolean(), nullable=False, server_default=sa.false()),
     )
     # MySQL rewrites the whole column definition on ALTER, so the type and
     # nullability have to be restated or they would be lost.
@@ -79,9 +84,16 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
+    """Downgrade schema.
+
+    Tables are dropped without dropping their indexes first: MySQL refuses to
+    drop an index that backs a foreign key ("needed in a foreign key
+    constraint"), and dropping the table removes its indexes on every engine.
+    """
     op.drop_index(op.f('ix_attendance_is_disputed'), table_name='attendance')
     op.drop_column('attendance', 'is_disputed')
-    op.drop_index(op.f('ix_advance_requests_status'), table_name='advance_requests')
-    op.drop_index(op.f('ix_advance_requests_worker_id'), table_name='advance_requests')
     op.drop_table('advance_requests')
+    # A PostgreSQL enum outlives its table; left behind, it would make a
+    # re-upgrade fail on "type already exists". No-op on MySQL.
+    if is_postgres():
+        op.execute('DROP TYPE IF EXISTS advance_request_status')

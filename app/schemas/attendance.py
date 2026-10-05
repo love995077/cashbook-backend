@@ -1,5 +1,6 @@
 from datetime import date as date_type
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -18,7 +19,10 @@ class AttendanceBase(BaseModel):
 
 
 class AttendanceCreate(AttendanceBase):
-    pass
+    # Where the day was worked. Optional: left out, the row takes the site the
+    # worker is posted to, which is what an offline phone replaying a mark
+    # from an older build relies on.
+    site_id: Optional[int] = Field(default=None, gt=0)
 
 
 class AttendanceScan(BaseModel):
@@ -60,6 +64,10 @@ class AttendanceRead(AttendanceBase):
 
     id: int
     site_id: Optional[int] = None
+    # The day rate this day is worth, frozen when it was marked: null when the
+    # worker had no rate yet, 0 when they were on piece rate. See
+    # `Attendance.wage_rate`.
+    wage_rate: Optional[Decimal] = None
     audio_note_url: Optional[str] = None
     # Drives the yellow row in the contractor's list and the flag state in the
     # worker's history, so both screens read it off the same field.

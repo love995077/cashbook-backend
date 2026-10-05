@@ -1,3 +1,4 @@
+from datetime import date as date_type
 from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Optional
@@ -166,6 +167,13 @@ class WorkerReplace(BaseModel):
     site_id: Optional[int] = Field(default=None, ge=0)
     is_active: bool = True
 
+    # "The rate was wrong, fix the days already marked too." Off by default:
+    # a raise is not a rewrite of last month. When on, every day-rated day
+    # from `reprice_from` (all of them when it is left out) takes the new
+    # rate, and its wage follows. See `reprice_days`.
+    reprice_existing: bool = False
+    reprice_from: Optional[date_type] = None
+
 
 class UserUpdate(BaseModel):
     """All fields optional — only the supplied ones are changed."""
@@ -186,8 +194,25 @@ class UserRead(UserBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    # The first day a deactivated worker no longer works here; null while they
+    # are active. See `User.deactivated_on`.
+    deactivated_on: Optional[date_type] = None
     created_at: datetime
     updated_at: datetime
+
+
+class WorkerSaved(UserRead):
+    """A worker as saved, plus what the save did to days already marked.
+
+    Both counts are usually zero. They are reported because either one moves
+    the worker's balance, and a balance that changes after "save details"
+    with no explanation is exactly the kind of number people stop trusting.
+    """
+
+    #: Days marked while the worker had no rate, now priced at the new one.
+    days_priced: int = 0
+    #: Days moved onto the new rate because `reprice_existing` was asked for.
+    days_repriced: int = 0
 
 
 class SiteBrief(BaseModel):

@@ -57,20 +57,24 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from app.core.migration_support import enum_type, ensure_enum, is_postgres
+
 # revision identifiers, used by Alembic.
 revision: str = 'f1d9a3c48b07'
 down_revision: Union[str, Sequence[str], None] = 'e8b4f1a6c072'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-WAGE_TYPE = sa.Enum('daily', 'piece_rate', name='wage_type')
-TOOL_STATUS = sa.Enum('out', 'returned', 'lost', name='tool_assignment_status')
+WAGE_TYPE_VALUES = ('daily', 'piece_rate')
+TOOL_STATUS_VALUES = ('out', 'returned', 'lost')
 
 # Must match MaterialUnit in app/models/enums.py, member for member. The
-# existing `site_materials.unit` column already carries this type; MySQL
-# stores enums per column rather than as a shared type, so repeating it here
-# creates nothing and collides with nothing.
-MATERIAL_UNIT = sa.Enum(
+# existing `site_materials.unit` column already carries this type. MySQL
+# stores enums per column rather than as a shared type, so repeating it there
+# creates nothing and collides with nothing; on PostgreSQL it is one named
+# type, created by the initial migration and only REFERRED to here - see
+# app/core/migration_support.py.
+MATERIAL_UNIT_VALUES = (
     'bag',
     'ton',
     'kg',
@@ -81,7 +85,6 @@ MATERIAL_UNIT = sa.Enum(
     'brass',
     'square_feet',
     'running_feet',
-    name='material_unit',
 )
 
 NOW = sa.text('now()')
@@ -97,6 +100,17 @@ def _timestamps() -> list[sa.Column]:
 
 def upgrade() -> None:
     """Upgrade schema."""
+    # Created explicitly rather than left to create_table: `wage_type` arrives
+    # through add_column, which never creates a PostgreSQL type, and
+    # `material_unit` already exists. No-ops on MySQL.
+    ensure_enum('wage_type', *WAGE_TYPE_VALUES)
+    ensure_enum('tool_assignment_status', *TOOL_STATUS_VALUES)
+    ensure_enum('material_unit', *MATERIAL_UNIT_VALUES)
+
+    WAGE_TYPE = enum_type('wage_type', *WAGE_TYPE_VALUES)
+    TOOL_STATUS = enum_type('tool_assignment_status', *TOOL_STATUS_VALUES)
+    MATERIAL_UNIT = enum_type('material_unit', *MATERIAL_UNIT_VALUES)
+
     # --- how a worker is paid ------------------------------------------------
     op.add_column(
         'users',
@@ -333,46 +347,27 @@ def downgrade() -> None:
     That is the right way round — deleting a worker's wages to undo a schema
     change would be far worse — but the rows will read as unexplained wages.
     """
-    op.drop_index(op.f('ix_material_receipts_received_by'), table_name='material_receipts')
-    op.drop_index(op.f('ix_material_receipts_inventory_id'), table_name='material_receipts')
-    op.drop_index(op.f('ix_material_receipts_date'), table_name='material_receipts')
-    op.drop_index(op.f('ix_material_receipts_site_id'), table_name='material_receipts')
     op.drop_table('material_receipts')
 
-    op.drop_index(op.f('ix_site_inventory_site_id'), table_name='site_inventory')
     op.drop_table('site_inventory')
 
-    op.drop_index(op.f('ix_tool_assignments_status'), table_name='tool_assignments')
-    op.drop_index(op.f('ix_tool_assignments_checkout_time'), table_name='tool_assignments')
-    op.drop_index(op.f('ix_tool_assignments_worker_id'), table_name='tool_assignments')
-    op.drop_index(op.f('ix_tool_assignments_tool_id'), table_name='tool_assignments')
     op.drop_table('tool_assignments')
 
-    op.drop_index(op.f('ix_tools_site_id'), table_name='tools')
     op.drop_table('tools')
 
-    op.drop_index(op.f('ix_deduction_installments_date'), table_name='deduction_installments')
-    op.drop_index(
-        op.f('ix_deduction_installments_worker_id'), table_name='deduction_installments'
-    )
-    op.drop_index(
-        op.f('ix_deduction_installments_deduction_id'), table_name='deduction_installments'
-    )
     op.drop_table('deduction_installments')
 
-    op.drop_index(op.f('ix_auto_deductions_is_active'), table_name='auto_deductions')
-    op.drop_index(op.f('ix_auto_deductions_worker_id'), table_name='auto_deductions')
     op.drop_table('auto_deductions')
 
-    op.drop_index(op.f('ix_piece_rate_logs_date'), table_name='piece_rate_logs')
-    op.drop_index(op.f('ix_piece_rate_logs_site_id'), table_name='piece_rate_logs')
-    op.drop_index(op.f('ix_piece_rate_logs_worker_id'), table_name='piece_rate_logs')
     op.drop_table('piece_rate_logs')
 
-    op.drop_index(op.f('ix_petty_cash_recorded_by'), table_name='petty_cash')
-    op.drop_index(op.f('ix_petty_cash_date'), table_name='petty_cash')
-    op.drop_index(op.f('ix_petty_cash_site_id'), table_name='petty_cash')
     op.drop_table('petty_cash')
 
     op.drop_index(op.f('ix_users_wage_type'), table_name='users')
     op.drop_column('users', 'wage_type')
+
+    # A PostgreSQL enum outlives the column that used it. `material_unit` is
+    # left alone: the initial migration owns it and site_materials still uses it.
+    if is_postgres():
+        op.execute('DROP TYPE IF EXISTS tool_assignment_status')
+        op.execute('DROP TYPE IF EXISTS wage_type')

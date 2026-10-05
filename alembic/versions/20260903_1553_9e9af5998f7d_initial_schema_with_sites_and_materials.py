@@ -10,6 +10,8 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
+from app.core.migration_support import is_postgres
+
 
 # revision identifiers, used by Alembic.
 revision: str = '9e9af5998f7d'
@@ -148,3 +150,11 @@ def downgrade() -> None:
     # sites.contractor_id references users, so sites goes first.
     op.drop_table('sites')
     op.drop_table('users')
+    # A PostgreSQL enum outlives its table; left behind, it would make a
+    # re-upgrade fail on "type already exists". No-op on MySQL.
+    if is_postgres():
+        op.execute('DROP TYPE IF EXISTS material_log_type')
+        op.execute('DROP TYPE IF EXISTS transaction_type')
+        op.execute('DROP TYPE IF EXISTS material_unit')
+        op.execute('DROP TYPE IF EXISTS attendance_status')
+        op.execute('DROP TYPE IF EXISTS user_role')

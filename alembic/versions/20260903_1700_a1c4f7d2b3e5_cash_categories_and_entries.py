@@ -14,6 +14,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from app.core.migration_support import is_postgres
+
 # revision identifiers, used by Alembic.
 revision: str = 'a1c4f7d2b3e5'
 down_revision: Union[str, Sequence[str], None] = '9e9af5998f7d'
@@ -80,13 +82,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
-    op.drop_index(op.f('ix_cash_entries_site_id'), table_name='cash_entries')
-    op.drop_index(op.f('ix_cash_entries_direction'), table_name='cash_entries')
-    op.drop_index(op.f('ix_cash_entries_date'), table_name='cash_entries')
-    op.drop_index(op.f('ix_cash_entries_contractor_id'), table_name='cash_entries')
-    op.drop_index(op.f('ix_cash_entries_category_id'), table_name='cash_entries')
+    """Downgrade schema.
+
+    Tables are dropped without dropping their indexes first: MySQL refuses to
+    drop an index that backs a foreign key ("needed in a foreign key
+    constraint"), and dropping the table removes its indexes on every engine.
+    """
     op.drop_table('cash_entries')
-    op.drop_index(op.f('ix_cash_categories_direction'), table_name='cash_categories')
-    op.drop_index(op.f('ix_cash_categories_contractor_id'), table_name='cash_categories')
     op.drop_table('cash_categories')
+    # A PostgreSQL enum outlives its table; left behind, it would make a
+    # re-upgrade fail on "type already exists". No-op on MySQL.
+    if is_postgres():
+        op.execute('DROP TYPE IF EXISTS cash_direction')

@@ -11,30 +11,52 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # A full SQLAlchemy URL. When set it wins over the DB_* parts below, which
-    # is how managed providers (Aiven, PlanetScale, RDS) are pointed at: they
-    # hand you one connection string rather than separate fields.
+    # is how a container stack or a managed provider is pointed at: they hand
+    # you one connection string rather than separate fields.
     #
-    # NOTE the URL must not carry `?ssl-mode=REQUIRED`. That is a mysql-client
-    # option; PyMySQL rejects it outright ("unexpected keyword argument
-    # 'ssl-mode'"). TLS is configured through db_ssl / db_ssl_ca below and
-    # applied via connect_args.
+    # PostgreSQL is the production engine. `postgres://` and `postgresql://`
+    # (the forms providers print) are both accepted and mapped onto the
+    # psycopg 3 driver - see `sqlalchemy_url`.
+    #
+    # MySQL is still understood, for the database the app is migrating away
+    # from: `mysql+pymysql://...`. That URL must not carry `?ssl-mode=REQUIRED`
+    # - a mysql-client option PyMySQL rejects outright. TLS for either engine
+    # is configured through db_ssl / db_ssl_ca below and applied via
+    # connect_args.
     database_url: str = ""
 
-    db_user: str = "root"
+    # The parts, used only when database_url is empty.
+    db_driver: str = "postgresql+psycopg"
+    db_user: str = "postgres"
     db_password: str = ""
     db_host: str = "localhost"
-    db_port: int = 3306
+    db_port: int = 5432
     db_name: str = "cash_book"
     db_echo: bool = False
 
-    # Connect over TLS. Managed MySQL requires it; a local server usually is not
-    # set up for it, so this defaults on only when a database_url is supplied.
+    # Connection pool, per process. Every gunicorn worker opens its own, so
+    # GUNICORN_WORKERS x (pool_size + max_overflow) must stay under the
+    # server's max_connections (100 on a stock PostgreSQL).
+    db_pool_size: int = 5
+    db_max_overflow: int = 5
+
+    # Connect over TLS. A managed MySQL requires it and always got it when a
+    # database_url was supplied, which stays true for MySQL. PostgreSQL gets
+    # TLS only when asked: the production database is a container on the same
+    # private network as the API and does not offer it.
     db_ssl: bool = False
-    # Path to the provider's CA certificate (Aiven: "CA certificate" on the
-    # service Overview page). Without it the connection is still encrypted, but
-    # the server's certificate is not verified against a known authority — set
-    # this for anything carrying real data.
+    # Path to the provider's CA certificate. Without it the connection is
+    # still encrypted, but the server's certificate is not verified against a
+    # known authority — set this for anything carrying real data.
     db_ssl_ca: str = ""
+
+    # The calendar the business runs on. "Today" - the day attendance is
+    # marked for, the newest date a ledger entry may carry, the end of a
+    # payroll period - is a date in THIS zone, never the server's. A
+    # container's clock is UTC, and an Indian site marking the morning's
+    # attendance at 00:30-05:29 IST would otherwise be told the day had not
+    # happened yet. See app/core/clock.py.
+    business_timezone: str = "Asia/Kolkata"
 
     # Create the schema and tables on startup. Convenient in development;
     # switch OFF in production, where every gunicorn worker would otherwise
@@ -107,27 +129,33 @@ class Settings(BaseSettings):
     def sqlalchemy_url(self) -> str:
         """The URL the engine connects with."""
         if self.database_url:
-            return self.database_url
+            return normalise_database_url(self.database_url)
         return (
-            f"mysql+pymysql://{self.db_user}:{self.db_password}"
+            f"{self.db_driver}://{self.db_user}:{self.db_password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
         )
 
     @property
+    def dialect(self) -> str:
+        """'postgresql', 'mysql' or 'sqlite' - the engine, not the driver."""
+        return dialect_of(self.sqlalchemy_url)
+
+    @property
     def connect_args(self) -> dict[str, Any]:
-        """Driver arguments, chiefly TLS.
+        """Driver arguments, chiefly TLS. Shaped for whichever engine is in use.
 
-        PyMySQL takes an `ssl` dict rather than a URL parameter. An empty dict
-        turns TLS on without verifying the server certificate; adding "ca"
-        verifies it against that authority.
+        PyMySQL takes an `ssl` dict rather than a URL parameter: an empty dict
+        turns TLS on without verifying the server certificate, adding "ca"
+        verifies it against that authority. psycopg takes libpq's `sslmode`.
+
+        The two engines differ on when TLS is assumed, deliberately. A managed
+        MySQL URL always meant TLS and still does. PostgreSQL in this
+        deployment is a container on the API's private network with no TLS
+        listener, so it is encrypted only when `db_ssl` asks for it.
         """
-        if not (self.db_ssl or self.uses_managed_url):
-            return {}
-
-        ssl: dict[str, Any] = {}
-        if self.db_ssl_ca:
-            ssl["ca"] = self.db_ssl_ca
-        return {"ssl": ssl}
+        return connect_args_for(
+            self.sqlalchemy_url, self.db_ssl, self.db_ssl_ca, managed=self.uses_managed_url
+        )
 
     @property
     def media_path(self) -> Path:
@@ -153,12 +181,13 @@ class Settings(BaseSettings):
     def server_url(self) -> str:
         """Same server as sqlalchemy_url, but without a database selected.
 
-        Used to create the database if it does not exist yet. Only meaningful
-        for a server you administer — a managed provider hands you a database
-        that already exists and an account without CREATE DATABASE rights.
+        Used to create a local MySQL database if it does not exist yet. Only
+        meaningful for a server you administer — a managed provider, or the
+        PostgreSQL container (which creates its database from POSTGRES_DB),
+        hands you a database that already exists.
         """
         return (
-            f"mysql+pymysql://{self.db_user}:{self.db_password}"
+            f"{self.db_driver}://{self.db_user}:{self.db_password}"
             f"@{self.db_host}:{self.db_port}"
         )
 
@@ -171,6 +200,74 @@ class Settings(BaseSettings):
             return make_url(self.sqlalchemy_url).render_as_string(hide_password=True)
         except Exception:
             return "<unparseable database url>"
+
+
+def normalise_database_url(url: str) -> str:
+    """Map the URL forms providers print onto the drivers this app ships.
+
+    `postgres://` (Heroku-style) and a bare `postgresql://` would both make
+    SQLAlchemy reach for psycopg2, which is not installed; psycopg 3 is. A
+    bare `mysql://` would reach for mysqlclient; PyMySQL is what is installed.
+    Anything that already names a driver is left exactly as given.
+    """
+    for bare, driver in (
+        ("postgres://", "postgresql+psycopg://"),
+        ("postgresql://", "postgresql+psycopg://"),
+        ("mysql://", "mysql+pymysql://"),
+    ):
+        if url.startswith(bare):
+            return driver + url[len(bare) :]
+    return url
+
+
+def dialect_of(url: str) -> str:
+    """The engine a URL points at, without the driver: 'postgresql' etc."""
+    return normalise_database_url(url).split(":", 1)[0].split("+", 1)[0]
+
+
+def connect_args_for(
+    url: str, ssl_on: bool = False, ssl_ca: str = "", managed: bool = False
+) -> dict[str, Any]:
+    """Driver arguments for `url`. See `Settings.connect_args`.
+
+    A module function rather than only a property so the migration tooling
+    can build arguments for a URL that is not the app's own - the MySQL
+    database being copied FROM, say - without inheriting the app's TLS rules
+    for the other engine. Feeding PyMySQL's `ssl` dict to psycopg (or to
+    `sqlite3.connect`) fails on connect, which is the trap this avoids.
+
+    `managed` says the URL was handed over whole (DATABASE_URL) rather than
+    composed from parts. For MySQL that has always meant a managed provider,
+    and therefore TLS.
+    """
+    dialect = dialect_of(url)
+
+    if dialect == "mysql":
+        if not (ssl_on or managed):
+            return {}
+        ssl: dict[str, Any] = {}
+        if ssl_ca:
+            ssl["ca"] = ssl_ca
+        return {"ssl": ssl}
+
+    if dialect == "postgresql":
+        args: dict[str, Any] = {
+            # Fail fast rather than hang a gunicorn worker on an unreachable
+            # database; pool_pre_ping turns the failure into a reconnect.
+            "connect_timeout": 10,
+        }
+        if ssl_on:
+            args["sslmode"] = "verify-full" if ssl_ca else "require"
+            if ssl_ca:
+                args["sslrootcert"] = ssl_ca
+        return args
+
+    if dialect == "sqlite":
+        # One in-memory database shared across the threads TestClient and the
+        # threadpool use.
+        return {"check_same_thread": False}
+
+    return {}
 
 
 @lru_cache
